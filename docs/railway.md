@@ -151,6 +151,16 @@ Startup prints `qwen-web remote listener on http://100.x.y.z:8766` when it is
 on. Invite people on the **Admin** tab of the local page (port 8765); everyone
 starts with Q8 only.
 
+To skip the second list, start with `QWEN_REMOTE_AUTO_INVITE=1` as well. Anyone
+who gets through Google sign-in then gets an account (Q8 only) on their first
+visit, so Google's **Test users** list is the only allowlist while the consent
+screen stays in Testing. Removing someone on the Admin tab blocks them from
+being re-added; inviting the address again by hand lifts the block.
+
+The remote listener sends TCP segments of at most 1,100 bytes: on the direct
+Tailscale path to Railway, full-size packets from the PC were silently dropped
+and pages hung after sign-in. `QWEN_REMOTE_TCP_MSS` overrides it (0 = off).
+
 ---
 
 ## 3. Secrets you generate

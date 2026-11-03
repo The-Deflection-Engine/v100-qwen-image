@@ -40,6 +40,12 @@ if [[ ${QWEN_REMOTE:-1} == 1 && -n $remote_origin && -f $remote_token_file ]]; t
       --remote-token-file "$remote_token_file"
       --remote-origin "$remote_origin"
     )
+    # QWEN_REMOTE_AUTO_INVITE=1: anyone who gets through Google sign-in gets
+    # an account (Q8 only) on first visit; Google's Test users list is then
+    # the only allowlist. People removed on the Admin tab stay out.
+    if [[ ${QWEN_REMOTE_AUTO_INVITE:-0} == 1 ]]; then
+      qwen_args+=(--remote-auto-invite)
+    fi
   else
     echo "notice: no Tailscale IPv4 address found; the remote listener is off" >&2
   fi

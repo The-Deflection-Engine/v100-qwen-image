@@ -247,3 +247,35 @@ def test_bind_sub_reports_a_mismatch_without_ever_rebinding(store):
     # The refusal keeps the FIRST binding, so the previous person's data stays
     # unreachable through the recycled address.
     assert store.get("alice@example.com")["sub"] == "123"
+
+
+def test_removal_blocks_auto_add_until_invited_again(store):
+    store.add("ann@example.com")
+    assert store.remove("ann@example.com") is True
+    assert store.is_blocked("ann@example.com")
+    assert store.auto_add("ann@example.com") is False
+    assert not store.is_invited("ann@example.com")
+    # The block survives a restart.
+    reloaded = UserStore(store.path)
+    assert reloaded.is_blocked("ann@example.com")
+    # Inviting by hand lifts it.
+    reloaded.add("ann@example.com")
+    assert not reloaded.is_blocked("ann@example.com")
+    assert reloaded.is_invited("ann@example.com")
+    assert "blocked" not in read_document(reloaded)
+
+
+def test_auto_add_invites_a_new_address_with_defaults(store):
+    assert store.auto_add("New@Example.com") is True
+    row = store.get("new@example.com")
+    assert row["allow"] == dict(users_module.DEFAULT_ALLOW)
+
+
+def test_a_file_listing_an_address_as_both_invited_and_blocked_is_refused(store):
+    store.add("ann@example.com")
+    document = read_document(store)
+    document["blocked"] = ["ann@example.com"]
+    with open(store.path, "w") as handle:
+        json.dump(document, handle)
+    with pytest.raises(UserStoreError):
+        UserStore(store.path)

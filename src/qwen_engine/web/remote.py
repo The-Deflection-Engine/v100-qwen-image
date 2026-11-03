@@ -207,15 +207,21 @@ def parse_identity(headers: Mapping[str, list[str]]) -> RemoteIdentity:
     return RemoteIdentity(email=email, sub=raw_sub)
 
 
-def verify_user(store: Any, identity: RemoteIdentity) -> RemoteIdentity:
+def verify_user(store: Any, identity: RemoteIdentity, *,
+                auto_invite: bool = False) -> RemoteIdentity:
     """Allowlist check plus account binding; 403 when not invited.
+
+    With ``auto_invite`` an address that is not on the list yet is added on
+    the spot (Q8 only), unless the admin removed it before: then Google
+    sign-in is the only gate, and removal still keeps a person out.
 
     The store is duck-typed (``is_invited``/``bind_sub``/``get``) so this
     module keeps no import-time dependency on the server's wiring. A bound
     account id that disagrees with the sign-in is treated as not invited: a
     recycled address must never reach the previous person's data.
     """
-    if not store.is_invited(identity.email):
+    if not store.is_invited(identity.email) and not (
+            auto_invite and _auto_add(store, identity.email)):
         raise ApiError(403, "not_invited",
                        "this account is not invited to use this server")
     try:
@@ -229,6 +235,13 @@ def verify_user(store: Any, identity: RemoteIdentity) -> RemoteIdentity:
     invited = store.get(identity.email)
     name = "" if invited is None else str(invited.get("display_name") or "")
     return RemoteIdentity(email=identity.email, sub=identity.sub, display_name=name)
+
+
+def _auto_add(store: Any, email: str) -> bool:
+    try:
+        return bool(store.auto_add(email))
+    except UserStoreError:  # full list, unwritable file: stay closed
+        return False
 
 
 def permissions(store: Any, identity: RemoteIdentity) -> dict[str, bool]:

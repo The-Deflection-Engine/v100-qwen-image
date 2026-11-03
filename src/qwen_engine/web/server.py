@@ -500,6 +500,9 @@ class RemoteSettings:
     users: "UserStore"
     web_runtime: WebRuntime
     generation: Any = None
+    #: Add anyone who gets through Google sign-in (Q8 only) instead of
+    #: refusing them as not invited. ``--remote-auto-invite``.
+    auto_invite: bool = False
 
 
 def remote_origin_error(value: str | None) -> str | None:
@@ -608,7 +611,8 @@ def remote_identity(settings: "RemoteSettings", headers: dict[str, list[str]]
     what the dispatcher uses as the owner id.
     """
     identity = _remote.verify_user(settings.users,
-                                  _remote.parse_identity(headers))
+                                  _remote.parse_identity(headers),
+                                  auto_invite=settings.auto_invite)
     return identity, _remote.permissions(settings.users, identity)
 
 
@@ -1592,6 +1596,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="the public origin browsers use, e.g. "
                         "https://studio.example.com: remote POSTs must carry "
                         "exactly this Origin")
+    p.add_argument("--remote-auto-invite", action="store_true",
+                   help="give anyone who signs in through the proxy an "
+                        "account (Q8 only) on first visit, so the sign-in "
+                        "provider's own allowlist is the only gate; people "
+                        "removed on the Admin tab stay out")
     for flag in ("output-dir", "cache-dir", "log-dir", "benchmarks-dir",
                  "references-dir"):
         p.add_argument(f"--{flag}", default=None,
@@ -2010,6 +2019,7 @@ def main(argv: list[str] | None = None) -> int:
                 origin=args.remote_origin,
                 users=user_store,
                 web_runtime=runtime,
+                auto_invite=bool(args.remote_auto_invite),
             )
         except (_remote.RemoteConfigError, UserStoreError) as exc:
             # Bounded operator diagnostic (a path may be named here; the wire

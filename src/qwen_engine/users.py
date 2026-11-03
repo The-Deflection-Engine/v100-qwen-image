@@ -10,6 +10,11 @@ never has to trust the file: a document whose schema tag, key set, email shape
 or flag types disagree with this module's contract is a typed
 :class:`UserStoreError` at load, never a silently half-adopted allowlist.
 
+With automatic invitations on (``--remote-auto-invite``), anyone who gets
+through Google sign-in is added on first visit. Removing a person then also
+records them under ``blocked`` so they are not re-added on their next visit;
+inviting the address again by hand lifts the block.
+
 Identity is the Google account ``sub``: the first sign-in records it
 (:meth:`UserStore.bind_sub`) and every later sign-in must present the same one,
 so an email that changes hands at the provider can never inherit the previous
@@ -166,8 +171,9 @@ class UserStore:
         self._lock = threading.RLock()
         self._path = None if path is None else os.fspath(path)
         self._users: dict[str, dict[str, Any]] = {}
+        self._blocked: frozenset[str] = frozenset()
         if self._path is not None:
-            self._users = self._load()
+            self._users, self._blocked = self._load()
 
     # -- reading ------------------------------------------------------------
 
@@ -175,12 +181,12 @@ class UserStore:
     def path(self) -> str | None:
         return self._path
 
-    def _load(self) -> dict[str, dict[str, Any]]:
+    def _load(self) -> tuple[dict[str, dict[str, Any]], frozenset[str]]:
         try:
             with open(self._path, "rb") as handle:
                 raw = handle.read(MAX_USERS_BYTES + 1)
         except FileNotFoundError:
-            return {}
+            return {}, frozenset()
         except OSError as exc:
             raise UserStoreError(
                 f"the user list is unreadable ({exc.strerror or 'storage error'})") from None
@@ -190,7 +196,8 @@ class UserStore:
             document = json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, ValueError, RecursionError):
             raise UserStoreError("the user list is not valid UTF-8 JSON") from None
-        if type(document) is not dict or set(document) != {"schema", "users"}:
+        if type(document) is not dict or set(document) not in (
+                {"schema", "users"}, {"schema", "users", "blocked"}):
             raise UserStoreError("the user list has an unexpected field set")
         if document["schema"] != USERS_SCHEMA:
             raise UserStoreError("the user list schema is unknown")
@@ -199,8 +206,18 @@ class UserStore:
             raise UserStoreError("the user list is not an object of users")
         if len(users) > MAX_USERS:
             raise UserStoreError("the user list exceeds its bounded size")
-        return {email: _validate_record(email, record)
-                for email, record in users.items()}
+        loaded = {email: _validate_record(email, record)
+                  for email, record in users.items()}
+        blocked = document.get("blocked", [])
+        if type(blocked) is not list or len(blocked) > MAX_USERS:
+            raise UserStoreError("the blocked list is not a bounded list")
+        for email in blocked:
+            if not isinstance(email, str) or _EMAIL_RE.fullmatch(email) is None \
+                    or email != email.strip().lower():
+                raise UserStoreError("a blocked email is not in its normalized form")
+            if email in loaded:
+                raise UserStoreError("an address is both invited and blocked")
+        return loaded, frozenset(blocked)
 
     def list_users(self) -> list[dict[str, Any]]:
         """Every invited person, in email order, as plain JSON-able dicts."""
@@ -225,6 +242,15 @@ class UserStore:
             return False
         with self._lock:
             return normalized in self._users
+
+    def is_blocked(self, email: str) -> bool:
+        """True for an address removed by the admin (and not re-invited)."""
+        try:
+            normalized = normalise_email(email)
+        except UserStoreError:
+            return False
+        with self._lock:
+            return normalized in self._blocked
 
     def permissions(self, email: str) -> dict[str, bool]:
         """The feature flags of an invited person; all-denied when the address
@@ -252,7 +278,7 @@ class UserStore:
 
     def add(self, email: str) -> dict[str, Any]:
         """Invite an address (idempotent: an existing person keeps their
-        permissions and their bound account id)."""
+        permissions and their bound account id). Lifts any block."""
         normalized = normalise_email(email)
         with self._lock:
             existing = self._users.get(normalized)
@@ -263,8 +289,24 @@ class UserStore:
             record = {"sub": None, "added": _now_stamp(), "display_name": "",
                       "allow": {flag: DEFAULT_ALLOW[flag]
                                 for flag in PERMISSIONS}}
-            self._publish({**self._users, normalized: record})
+            self._publish({**self._users, normalized: record},
+                          self._blocked - {normalized})
             return _row(normalized, record)
+
+    def auto_add(self, email: str) -> bool:
+        """Invite an address on its first sign-in unless the admin removed it.
+
+        ``True`` when the address is (now) invited. A new account gets the
+        same defaults as a hand-made invite (Q8 only).
+        """
+        normalized = normalise_email(email)
+        with self._lock:
+            if normalized in self._users:
+                return True
+            if normalized in self._blocked:
+                return False
+            self.add(normalized)
+            return True
 
     def set_permissions(self, email: str, **flags: bool) -> dict[str, Any]:
         """Change some flags, leaving the others alone.
@@ -346,18 +388,28 @@ class UserStore:
                 return False
             remaining = {key: value for key, value in self._users.items()
                          if key != normalized}
-            self._publish(remaining)
+            blocked = self._blocked
+            if len(blocked) < MAX_USERS:
+                blocked = blocked | {normalized}
+            self._publish(remaining, blocked)
             return True
 
     # -- persistence --------------------------------------------------------
 
-    def _document(self, users: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
-        return {"schema": USERS_SCHEMA,
-                "users": {email: {key: (dict(value) if key == "allow" else value)
-                                  for key, value in record.items()}
-                          for email, record in users.items()}}
+    def _document(self, users: Mapping[str, Mapping[str, Any]],
+                  blocked: frozenset[str]) -> dict[str, Any]:
+        document = {"schema": USERS_SCHEMA,
+                    "users": {email: {key: (dict(value) if key == "allow" else value)
+                                      for key, value in record.items()}
+                              for email, record in users.items()}}
+        # Written only when non-empty, so a list nobody was ever removed from
+        # keeps the original two-key shape.
+        if blocked:
+            document["blocked"] = sorted(blocked)
+        return document
 
-    def _publish(self, users: dict[str, dict[str, Any]]) -> None:
+    def _publish(self, users: dict[str, dict[str, Any]],
+                 blocked: frozenset[str] | None = None) -> None:
         """Write the whole document atomically, then adopt it.
 
         The in-memory copy is replaced ONLY after the file took the new
@@ -366,7 +418,9 @@ class UserStore:
         """
         if self._path is None:
             raise UserStoreError("this server has no cache directory to store users in")
-        payload = json.dumps(self._document(users), sort_keys=True,
+        if blocked is None:
+            blocked = self._blocked
+        payload = json.dumps(self._document(users, blocked), sort_keys=True,
                              ensure_ascii=False).encode("utf-8")
         if len(payload) > MAX_USERS_BYTES:
             raise UserStoreError("the user list exceeds its bounded size")
@@ -395,6 +449,7 @@ class UserStore:
                 pass
             raise
         self._users = users
+        self._blocked = frozenset(blocked)
 
 
 def _fsync_directory(directory: str) -> None:

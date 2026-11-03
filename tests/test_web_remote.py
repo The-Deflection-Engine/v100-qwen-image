@@ -348,6 +348,28 @@ def test_an_unknown_account_is_not_invited(remote):
     assert code_of(out) == "not_invited"
 
 
+def test_auto_invite_adds_a_new_account_with_q8_only(remote, users):
+    from dataclasses import replace
+    out = drive(request("/api/v1/status",
+                        headers=remote_headers(("carol@example.com", "333"))),
+                remote=replace(remote, auto_invite=True))
+    assert " 200 " in status_line(out), out
+    row = users.get("carol@example.com")
+    assert row is not None and row["sub"] == "333"
+    assert row["allow"] == {"q8": True, "2k": False, "edit": False,
+                            "official_enhancer": False}
+
+
+def test_auto_invite_keeps_out_someone_the_admin_removed(remote, users):
+    from dataclasses import replace
+    assert users.remove(BOB[0]) is True
+    out = drive(request("/api/v1/status", headers=remote_headers(BOB)),
+                remote=replace(remote, auto_invite=True))
+    assert " 403 " in status_line(out)
+    assert code_of(out) == "not_invited"
+    assert users.get(BOB[0]) is None
+
+
 def test_a_recycled_address_must_present_the_bound_account_id(remote, users):
     users.bind_sub(ALICE[0], ALICE[1])
     out = drive(request("/api/v1/status",
