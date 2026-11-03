@@ -1287,6 +1287,26 @@ def stop_workers(conn_queue: "queue.Queue[Any]",
     return still_alive
 
 
+#: Largest TCP segment the remote listener sends. Railway reaches the PC over a
+#: direct Tailscale path, and on that path full-size packets from the PC
+#: (1,228-byte segments in a 1,280-byte tailnet packet) were silently dropped:
+#: small replies arrived, the page itself never did, and the browser hung.
+#: Smaller segments keep every packet under the black hole. Override with
+#: QWEN_REMOTE_TCP_MSS (0 turns the clamp off).
+REMOTE_TCP_MAXSEG = 1100
+
+
+def _remote_tcp_maxseg() -> int | None:
+    raw = os.environ.get("QWEN_REMOTE_TCP_MSS", "").strip()
+    if not raw:
+        return REMOTE_TCP_MAXSEG
+    try:
+        value = int(raw)
+    except ValueError:
+        return REMOTE_TCP_MAXSEG
+    return value if value > 0 else None
+
+
 class _Server(HTTPServer):
     """Explicit-address server with a BOUNDED POOL of persistent worker threads —
     no per-connection thread creation, finite handler idle timeout via
@@ -1306,7 +1326,22 @@ class _Server(HTTPServer):
     admin: Any
     admin_enabled: bool
 
-    def __init__(self, addr_info, handler) -> None:
+    #: When set, every connection accepted by this listener sends TCP segments
+    #: no larger than this. Set for the remote listener only: see
+    #: REMOTE_TCP_MAXSEG.
+    tcp_max_segment: int | None = None
+
+    def server_bind(self) -> None:
+        # Must happen before listen(): accepted sockets inherit the option.
+        if self.tcp_max_segment and hasattr(socket, "TCP_MAXSEG"):
+            self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_MAXSEG,
+                                   self.tcp_max_segment)
+        super().server_bind()
+
+    def __init__(self, addr_info, handler, *,
+                 tcp_max_segment: int | None = None) -> None:
+        # Read by server_bind, which runs inside the base constructor.
+        self.tcp_max_segment = tcp_max_segment
         self._queue: "queue.Queue[Any]" = queue.Queue(
             maxsize=MAX_QUEUED_CONNECTIONS)
         self._workers: list[threading.Thread] = []
@@ -2051,8 +2086,10 @@ def main(argv: list[str] | None = None) -> int:
         remote_settings = replace(remote_settings, generation=httpd.generation)
         remote_port = args.remote_port
         try:
+            max_segment = _remote_tcp_maxseg()
             for host in dict.fromkeys(args.remote_host):
-                listener = _Server((host, remote_port), _Handler)
+                listener = _Server((host, remote_port), _Handler,
+                                   tcp_max_segment=max_segment)
                 remote_listeners.append(listener)
                 remote_port = int(listener.server_address[1])
                 listener.web_runtime = runtime
