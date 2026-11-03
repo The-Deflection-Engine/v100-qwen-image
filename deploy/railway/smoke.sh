@@ -33,7 +33,8 @@ readonly PROXY_TOKEN="smoke-proxy-token-0123456789abcdef"
 readonly DEV_EMAIL="Invited.Person@Example.COM"
 # Obviously fake and fixed: a 32-byte base64 cookie secret, the shape the
 # entrypoint validates. Never a real secret.
-readonly COOKIE_SECRET="c21va2Utb25seS1jb29raWUtc2VjcmV0LTMyYnl0ZXM="
+# URL-safe on purpose ("-" and "_"): the form oauth2-proxy accepts.
+readonly COOKIE_SECRET="c21va2-_b25seS1jb29raWUtc2VjcmV0LTMyYnl0ZXM="
 
 BUILD=1
 if [ "${1:-}" = "--no-build" ]; then

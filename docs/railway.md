@@ -161,12 +161,13 @@ Run these locally; never paste them into a repository or a chat.
 # The shared secret the gateway sends to the PC: use the value already in the
 # PC's cache/remote-token (section 2.3), not a second one.
 cat cache/remote-token           # -> LIGHTSEED_PROXY_TOKEN
-# oauth2-proxy cookie secret: any of 16, 24 or 32 bytes, base64 encoded.
-openssl rand -base64 32          # -> OAUTH2_PROXY_COOKIE_SECRET
+# oauth2-proxy cookie secret: 32 hex characters. Not `openssl rand -base64`:
+# oauth2-proxy only accepts URL-safe base64, and rejects "+" and "/".
+openssl rand -hex 16             # -> OAUTH2_PROXY_COOKIE_SECRET
 ```
 
 `LIGHTSEED_PROXY_TOKEN` must be at least 32 characters (the entrypoint refuses
-shorter ones). The cookie secret must decode to exactly 16, 24 or 32 bytes; the
+shorter ones). The cookie secret must be 16, 24 or 32 bytes, raw or URL-safe base64; the
 entrypoint checks this at boot rather than letting oauth2-proxy fail later.
 
 ---
@@ -184,7 +185,7 @@ Railway — do not set it.
 | `TS_AUTHKEY` | `tskey-auth-...` | Ephemeral, reusable, `tag:railway`. |
 | `OAUTH2_PROXY_CLIENT_ID` | from Google | |
 | `OAUTH2_PROXY_CLIENT_SECRET` | from Google | |
-| `OAUTH2_PROXY_COOKIE_SECRET` | `openssl rand -base64 32` | 16/24/32 decoded bytes. |
+| `OAUTH2_PROXY_COOKIE_SECRET` | `openssl rand -hex 16` | Not `-base64`: oauth2-proxy rejects `+` and `/`. |
 | `LIGHTSEED_HOSTNAME` | `lightseed-railway` *(optional)* | Tailscale machine name. |
 | `LIGHTSEED_VERSION` | short git sha *(optional)* | Shown on the offline page. Defaults to `unknown`. |
 | `LIGHTSEED_LOG_REQUESTS` | `1` *(optional)* | One line per proxied request, identity hashed to 12 hex chars. |
@@ -275,7 +276,7 @@ check that the PC's invitation list is what actually decides access.
 | Secret | How to rotate | What breaks if you skip the other side |
 |---|---|---|
 | `LIGHTSEED_PROXY_TOKEN` | Generate a new value; update the PC's `remote-token` file and restart the PC's server; update the Railway variable. Do the PC first, then Railway, so there is never a window where the edge sends a token the PC rejects. | PC answers 401 to every proxied request. |
-| `OAUTH2_PROXY_COOKIE_SECRET` | Generate a new base64 secret; update the variable; Railway restarts. | Every existing session is invalidated — visitors sign in once more. That is the point. |
+| `OAUTH2_PROXY_COOKIE_SECRET` | Generate a new one with `openssl rand -hex 16`; update the variable; Railway restarts. | Every existing session is invalidated — visitors sign in once more. That is the point. |
 | `OAUTH2_PROXY_CLIENT_SECRET` | Google Console -> the client -> **Reset secret**; update the variable immediately. | Sign-in fails with `invalid_client` until the values match. |
 | `TS_AUTHKEY` | Generate a new ephemeral key, update the variable, redeploy; revoke the old key in the Keys list. | The node cannot re-register; `/healthz` reports `tailscale_down` and Railway restart-loops on failure. |
 | Tailscale node | If the container is compromised: admin console -> Machines -> delete `lightseed-railway`; rotate the auth key and both edge secrets. | — |

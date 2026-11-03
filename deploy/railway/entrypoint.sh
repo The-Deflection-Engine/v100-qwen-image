@@ -125,18 +125,22 @@ if [ "$DEV_MODE" -eq 0 ]; then
     die "LIGHTSEED_PROXY_TOKEN must be at least 32 characters"
   fi
 
-  # oauth2-proxy accepts a 16, 24 or 32 byte cookie secret, base64 encoded.
-  # Checking here turns a silent mid-run failure into a boot failure.
-  case "${#OAUTH_COOKIE_SECRET}" in
-    24|32|44) ;;
-    *) die "OAUTH2_PROXY_COOKIE_SECRET must be a base64 cookie secret (24/32/44 chars for 16/24/32 bytes)" ;;
+  # oauth2-proxy's own rule: decode the secret as URL-safe base64; if that works
+  # and gives 16, 24 or 32 bytes, use it, otherwise use the raw text, which must
+  # then be 16, 24 or 32 characters. Standard base64 ('+' or '/', as printed by
+  # `openssl rand -base64`) is NOT URL-safe, so it falls through to the raw
+  # length and fails. Checking here turns that into a clear boot message.
+  cookie_hint="generate one with: openssl rand -hex 16"
+  case "$OAUTH_COOKIE_SECRET" in
+    *[+/]*) die "OAUTH2_PROXY_COOKIE_SECRET contains '+' or '/': oauth2-proxy needs URL-safe base64; $cookie_hint" ;;
   esac
-  printf '%s' "$OAUTH_COOKIE_SECRET" | base64 -d >/dev/null 2>&1 ||
-    die "OAUTH2_PROXY_COOKIE_SECRET is not valid base64"
-  cookie_bytes="$(printf '%s' "$OAUTH_COOKIE_SECRET" | base64 -d | wc -c | tr -d ' ')"
-  case "$cookie_bytes" in
-    16|24|32) ;;
-    *) die "OAUTH2_PROXY_COOKIE_SECRET decodes to $cookie_bytes bytes; needs 16, 24 or 32" ;;
+  cookie_bytes=0
+  if cookie_decoded="$(printf '%s' "$OAUTH_COOKIE_SECRET" | tr -- '-_' '+/' | base64 -d 2>/dev/null | wc -c)"; then
+    cookie_bytes="$(printf '%s' "$cookie_decoded" | tr -d ' ')"
+  fi
+  case "$cookie_bytes:${#OAUTH_COOKIE_SECRET}" in
+    16:*|24:*|32:*|*:16|*:24|*:32) ;;
+    *) die "OAUTH2_PROXY_COOKIE_SECRET must be 16, 24 or 32 bytes (raw, or URL-safe base64); $cookie_hint" ;;
   esac
 fi
 
