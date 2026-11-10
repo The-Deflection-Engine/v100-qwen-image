@@ -1,0 +1,33 @@
+# Railway service definition for the Lightseed Studio edge.
+#
+# THIS FILE IS NOT APPLIED for new services. Railway deprecated Config as Code:
+# new services cannot opt into it, and railway.json / railway.toml stop being
+# read on 2026-12-01 (https://docs.railway.com/config-as-code). Set these values
+# by hand in the dashboard instead -- docs/railway.md section 5 lists them.
+# The file is kept as the machine-readable record of what those settings must be,
+# and because it becomes live again only if Railway reverses that deprecation.
+#
+# Set the service's root directory to deploy/railway (Settings -> Source ->
+# Root Directory).
+#
+# Nothing here creates infrastructure: the project, the volume-free service and
+# the variables are all created by hand from docs/railway.md.
+
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+# /healthz answers 200 in every state where serving is possible (the PC being
+# switched off is reported as "degraded" so Railway does not restart the
+# service in a loop) and 503 only when Tailscale itself is down.
+healthcheckPath = "/healthz"
+healthcheckTimeout = 30
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10
+# One replica: the proxy token and the Tailscale node identity are per-service,
+# and there is nothing to scale (all work happens on the PC).
+numReplicas = 1
+
+# Every setting, secret included, is a service variable created from
+# docs/railway.md. Railway injects PORT; no other file here holds config.

@@ -37,6 +37,7 @@ from qwen_engine._jsonsafe import strict_json_loads
 from qwen_engine.config import ConfigError, GenerationConfig
 from qwen_engine.core import GenerationResult
 from qwen_engine.errors import GenerationCancelled, OutOfGpuMemoryError
+from qwen_engine.owners import LOCAL_OWNER, OwnerError, check_owner
 
 MAX_REQUEST_BYTES = 256 * 1024
 MAX_ARTIFACT_BYTES = 256 * 1024 * 1024
@@ -47,8 +48,13 @@ MAX_ARTIFACT_BYTES = 256 * 1024 * 1024
 JOB_RECORD_NAME = "job.json"
 JOB_RECORD_SCHEMA = "qwen_engine.job_record.v1"
 MAX_RECORD_BYTES = MAX_REQUEST_BYTES + 8 * 1024
-_RECORD_KEYS = frozenset({"schema", "job_id", "state", "error_code", "cancel_requested",
-                          "created_ns", "finished_ns", "config", "artifact"})
+#: The field set written before owner tagging existed.
+_RECORD_KEYS_V1 = frozenset({"schema", "job_id", "state", "error_code", "cancel_requested",
+                             "created_ns", "finished_ns", "config", "artifact"})
+#: Records written before owner tagging existed have no ``owner``; they are
+#: read back as :data:`~qwen_engine.owners.LOCAL_OWNER` (they can only have
+#: been submitted by the person at the machine).
+_RECORD_KEYS = _RECORD_KEYS_V1 | {"owner"}
 _ARTIFACT_KEYS = frozenset({"filename", "bytes", "sha256"})
 #: Closed set of fixed, prompt-free failure codes a record may carry.
 _ERROR_CODES = frozenset({"execution_failed", "worker_stopped",
@@ -97,6 +103,10 @@ class JobHistoryFullError(JobError):
     """Terminal history is full; forget terminal entries to accept new jobs."""
 
 
+class JobQueueLimitError(JobError):
+    """This owner already has as many live (queued/running) jobs as allowed."""
+
+
 class JobCancelled(Exception):
     """Executor acknowledged cancellation after releasing its resources."""
 
@@ -129,6 +139,10 @@ class JobSnapshot:
     cancel_requested: bool = False
     artifact: JobArtifact | None = None
     error_code: str | None = None
+    #: Who submitted this job: :data:`LOCAL_OWNER` for the person at the
+    #: machine, the provider account id for a remote user. Last field so every
+    #: existing positional construction keeps meaning what it did.
+    owner: str = LOCAL_OWNER
 
     @property
     def terminal(self):
@@ -141,6 +155,10 @@ class JobContext:
     config: GenerationConfig
     _cancel: threading.Event
     _report: Callable[[str], None]
+    #: The submitting owner, so an executor can apply per-owner bookkeeping
+    #: (the remote history cap) after its own work succeeds. Last field so
+    #: every existing positional construction keeps meaning what it did.
+    owner: str = LOCAL_OWNER
 
     @property
     def cancel_requested(self):
@@ -194,6 +212,19 @@ def _signature(info) -> tuple[int, ...]:
     return tuple(getattr(info, name) for name in _STAT_FIELDS)
 
 
+def normalize_owner(value: object) -> str:
+    """Validate one owner id, mapping the shared grammar onto :class:`JobError`.
+
+    ``local`` and provider account ids share exactly one grammar
+    (:mod:`qwen_engine.owners`); this wrapper only binds the refusal to the
+    job contract so a bad owner never surfaces as a bare ``ValueError``.
+    """
+    try:
+        return check_owner(value)
+    except OwnerError:
+        raise JobError("job owner must be a bounded printable string without whitespace") from None
+
+
 def job_record_document(record: JobSnapshot, *, created_ns: int, finished_ns: int) -> dict:
     """The exact terminal-state record stored in a job's own directory.
 
@@ -223,6 +254,7 @@ def job_record_document(record: JobSnapshot, *, created_ns: int, finished_ns: in
         "cancel_requested": bool(record.cancel_requested),
         "created_ns": created_ns,
         "finished_ns": finished_ns,
+        "owner": normalize_owner(record.owner),
         "config": record.config.to_dict(),
         "artifact": None if artifact is None else {
             "filename": artifact.filename,
@@ -247,12 +279,17 @@ def load_job_record(raw: bytes, *, job_id: str, output_dir: str) -> tuple[JobSna
         document = strict_json_loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, ValueError, RecursionError):
         raise JobError("job record is not strict UTF-8 JSON") from None
-    if type(document) is not dict or set(document) != _RECORD_KEYS:
+    if type(document) is not dict or frozenset(document) not in (_RECORD_KEYS,
+                                                                _RECORD_KEYS_V1):
         raise JobError("job record has an unexpected field set")
     if document["schema"] != JOB_RECORD_SCHEMA:
         raise JobError("job record schema is unknown")
     if document["job_id"] != job_id:
         raise JobError("job record belongs to another job")
+    # A record written before owner tagging can only have come from the person
+    # at the machine, so it reads back as ``local`` — never as "unknown", which
+    # would hide every existing entry from History after an upgrade.
+    owner = normalize_owner(document.get("owner", LOCAL_OWNER))
     state = document["state"]
     try:
         if not isinstance(state, str):
@@ -308,7 +345,8 @@ def load_job_record(raw: bytes, *, job_id: str, output_dir: str) -> tuple[JobSna
     if (artifact is None) != (state != JobState.SUCCEEDED):
         raise JobError("job record artifact does not match its state")
     return (JobSnapshot(job_id, config, state=state, cancel_requested=cancel_requested,
-                        artifact=artifact, error_code=error_code), created_ns, finished_ns)
+                        artifact=artifact, error_code=error_code, owner=owner),
+            created_ns, finished_ns)
 
 
 def release_cyclic_references() -> None:
@@ -379,11 +417,26 @@ class JobController:
         if not stat.S_ISDIR(info.st_mode) or (info.st_dev, info.st_ino) != self._root_identity:
             raise JobError("artifact root changed")
 
-    def submit(self, config: GenerationConfig) -> JobSnapshot:
+    def submit(self, config: GenerationConfig, *, owner: str = LOCAL_OWNER,
+               max_live: int | None = None) -> JobSnapshot:
+        """Queue one job; ``max_live`` caps THAT OWNER's queued+running jobs.
+
+        The count is taken under the same lock hold that appends to the queue,
+        so two simultaneous submissions can never both pass a limit of one.
+        A refusal is :class:`JobQueueLimitError`, distinct from the global
+        history/queue terms, because the two call for different advice.
+        """
         config = _request(config)
+        owner = normalize_owner(owner)
+        if max_live is not None and (type(max_live) is not int or max_live < 1):
+            raise JobError("invalid per-owner live job limit")
         with self._condition:
             if self._closing:
                 raise JobError("controller closed or worker unavailable")
+            if max_live is not None and sum(
+                    1 for record in self._records.values()
+                    if record.owner == owner and not record.terminal) >= max_live:
+                raise JobQueueLimitError("this account already has a job queued or running")
             if len(self._records) >= self._max_records:
                 raise JobHistoryFullError("job history full; explicitly forget terminal metadata")
             if len(self._pending) >= self._max_pending:
@@ -402,7 +455,7 @@ class JobController:
             if not stat.S_ISDIR(directory.st_mode):
                 raise JobError("new job directory changed")
             self._directories[job_id] = (directory.st_dev, directory.st_ino)
-            record = JobSnapshot(job_id, config)
+            record = JobSnapshot(job_id, config, owner=owner)
             self._records[job_id] = record
             self._created_ns[job_id] = time.time_ns()
             self._cancels[job_id] = threading.Event()
@@ -410,29 +463,66 @@ class JobController:
             self._condition.notify_all()
             return record
 
-    def _record(self, job_id):
+    def _record(self, job_id, owner=None):
+        """One record, optionally narrowed to one owner.
+
+        An id that exists but belongs to somebody else is the SAME fixed
+        "unknown job" refusal as an id that never existed: a remote user may
+        not learn that another person's job id is real.
+        """
         if (type(job_id) is not str or len(job_id) != 32
                 or any(c not in "0123456789abcdef" for c in job_id)
                 or job_id not in self._records):
             raise JobError("unknown job")
-        return self._records[job_id]
+        record = self._records[job_id]
+        if owner is not None and record.owner != normalize_owner(owner):
+            raise JobError("unknown job")
+        return record
 
-    def get(self, job_id: str) -> JobSnapshot:
+    def get(self, job_id: str, *, owner: str | None = None) -> JobSnapshot:
         with self._condition:
-            return self._record(job_id)
+            return self._record(job_id, owner)
 
-    def snapshots(self) -> tuple[JobSnapshot, ...]:
+    def snapshots(self, *, owner: str | None = None) -> tuple[JobSnapshot, ...]:
+        """Every record, or exactly one owner's. Order is submission order."""
+        wanted = None if owner is None else normalize_owner(owner)
         with self._condition:
-            return tuple(self._records.values())
+            return tuple(record for record in self._records.values()
+                         if wanted is None or record.owner == wanted)
 
-    def read_artifact(self, job_id: str) -> bytes:
+    def queue_position(self, job_id: str) -> int | None:
+        """Where this job stands in the queue: 0 running, N pending, else None.
+
+        Read from the controller's own pending order under its lock, so the
+        number is the order the worker will actually take; a terminal (or
+        unknown) job answers None — it has left the queue.
+        """
+        with self._condition:
+            record = self._records.get(job_id)
+            if record is None or record.terminal:
+                return None
+            if self._active == job_id:
+                return 0
+            try:
+                return self._pending.index(job_id) + 1
+            except ValueError:
+                return None
+
+    def finished_for(self, owner: str) -> int:
+        """How many TERMINAL jobs this owner has (what a history cap counts)."""
+        wanted = normalize_owner(owner)
+        with self._condition:
+            return sum(1 for record in self._records.values()
+                       if record.owner == wanted and record.terminal)
+
+    def read_artifact(self, job_id: str, *, owner: str | None = None) -> bytes:
         """Read only a recorded, successful artifact through owned directory FDs.
 
         Recheck the saved digest on the actual bytes returned: replacing a file
         after job completion must never turn the image endpoint into file access.
         """
         with self._condition:
-            record = self._record(job_id)
+            record = self._record(job_id, owner)
             artifact = record.artifact
             if record.state != JobState.SUCCEEDED or artifact is None:
                 raise JobError("job has no completed artifact")
@@ -486,9 +576,9 @@ class JobController:
         finally:
             os.close(fd)
 
-    def cancel(self, job_id: str) -> JobSnapshot:
+    def cancel(self, job_id: str, *, owner: str | None = None) -> JobSnapshot:
         with self._condition:
-            record = self._record(job_id)
+            record = self._record(job_id, owner)
             if record.terminal:
                 return record
             self._cancels[job_id].set()
@@ -507,20 +597,26 @@ class JobController:
             self._condition.notify_all()
             return record
 
-    def forget(self, job_id: str, *, delete_files: bool = False) -> int:
+    def forget(self, job_id: str, *, delete_files: bool = False,
+               owner: str | None = None) -> int:
         """Evict one terminal job's history; returns the number of files deleted.
 
         ``delete_files`` (exact bool, default False) additionally deletes the
         job's own directory through ``_delete_job_directory``'s checks; the
-        default forget touches no files at all, exactly as before.
+        default forget touches no files at all, exactly as before. ``owner``
+        narrows the target to one owner, sharing the "unknown job" refusal, so
+        a remote user cannot forget somebody else's entry by guessing its id.
         """
         if type(delete_files) is not bool:
             raise JobError("delete_files must be boolean")
         with self._condition:
-            return self._forget_locked(job_id, delete_files)
+            return self._forget_locked(job_id, delete_files, owner)
 
-    def forget_all(self, *, delete_files: bool = False) -> tuple[int, int, int]:
+    def forget_all(self, *, delete_files: bool = False, owner: str | None = None
+                   ) -> tuple[int, int, int]:
         """Forget EVERY terminal job; queued/running/cancelling jobs untouched.
+
+        ``owner`` narrows it to one owner's jobs (and the live count to theirs).
 
         Returns ``(forgotten, deleted_files, skipped_live)``. Each entry goes
         through exactly the one-forget path, under one lock hold per job set
@@ -529,22 +625,45 @@ class JobController:
         """
         if type(delete_files) is not bool:
             raise JobError("delete_files must be boolean")
+        wanted = None if owner is None else normalize_owner(owner)
         with self._condition:
             forgotten = deleted = 0
             for job_id in tuple(job_id for job_id, record in self._records.items()
-                                if record.terminal):
+                                if record.terminal
+                                and (wanted is None or record.owner == wanted)):
                 deleted += self._forget_locked(job_id, delete_files)
                 forgotten += 1
-            return forgotten, deleted, len(self._records)
+            return forgotten, deleted, sum(
+                1 for record in self._records.values()
+                if wanted is None or record.owner == wanted)
 
-    def _forget_locked(self, job_id: str, delete_files: bool) -> int:
+    def forget_owner(self, owner: str, *, delete_files: bool = False) -> tuple[int, int]:
+        """Forget every TERMINAL job of one owner; ``(forgotten, deleted_files)``.
+
+        This is the history-cap reaper: it may run while the owner's other
+        jobs are live (cap replacement happens right after a success), so live
+        entries are simply left alone rather than refusing the whole call.
+        """
+        if type(delete_files) is not bool:
+            raise JobError("delete_files must be boolean")
+        wanted = normalize_owner(owner)
+        with self._condition:
+            forgotten = deleted = 0
+            for job_id in tuple(job_id for job_id, record in self._records.items()
+                                if record.owner == wanted and record.terminal):
+                deleted += self._forget_locked(job_id, delete_files)
+                forgotten += 1
+            return forgotten, deleted
+
+    def _forget_locked(self, job_id: str, delete_files: bool,
+                       owner: str | None = None) -> int:
         """One forget, with the controller lock already held by the caller.
 
         Removing the stored record is what makes a forget survive a restart;
         files are touched ONLY via ``_delete_job_directory`` and only when
         the caller explicitly passed the opt-in.
         """
-        if not self._record(job_id).terminal:
+        if not self._record(job_id, owner).terminal:
             raise JobError("cannot forget live job")
         self._discard_job_record(job_id)
         # Deleted while _directories still carries this job's identity, so
@@ -923,7 +1042,8 @@ class JobController:
                     self._records[job_id] = replace(self._records[job_id], state=JobState.RUNNING)
                     record = self._records[job_id]
                     context = JobContext(job_id, record.config, self._cancels[job_id],
-                                         lambda phase, owned=job_id: self._phase(owned, phase))
+                                         lambda phase, owned=job_id: self._phase(owned, phase),
+                                         owner=record.owner)
                     self._condition.notify_all()
                 artifact = None
                 error = None

@@ -151,7 +151,11 @@ def test_generation_is_status_gated_with_only_same_origin_api_calls():
     # The connection probe hangs off the settings route rather than inventing
     # a third one, so it is built from the constant above.
     assert "var API_REWRITE_SETTINGS_TEST = API_REWRITE_SETTINGS + '/test';" in js
-    assert "!apiConnected || !generationConnected || submittingJob" in js
+    # The gate is the connection pair plus whatever else forbids a submit: an
+    # in-flight submit always does, and (remote pages only) a job already in
+    # flight, because the server allows that account exactly one.
+    assert "!apiConnected || !generationConnected ||" in js
+    assert "submittingJob || queued" in js
     html = _read("index.html")
     m = re.search(r'id="generate-btn"[^>]*', html)
     assert m and "disabled" in m.group(0), "Generate must start disabled"
@@ -1608,9 +1612,13 @@ def test_use_as_reference_reads_the_job_image_endpoint_and_reuses_the_upload():
     # The closed set of routes the page knows. The rewriter Settings page adds
     # exactly two (read the choice, write the choice) plus the probe hanging off
     # the write route; first-run model setup adds three (read the catalogue,
-    # start the download, cancel it). Nothing else may appear.
+    # start the download, cancel it); the local-only Admin page adds five (read
+    # the account list, add, remove, permissions, display name). Nothing else
+    # may appear.
     assert sorted(set(re.findall(r"var (API_[A-Z_]+) = ", js))) == \
-        ["API_EXPORT", "API_IMPORT", "API_JOBS", "API_JOBS_FORGET_ALL",
+        ["API_ADMIN_ADD", "API_ADMIN_DISPLAY_NAME", "API_ADMIN_PERMISSIONS",
+         "API_ADMIN_REMOVE", "API_ADMIN_USERS",
+         "API_EXPORT", "API_IMPORT", "API_JOBS", "API_JOBS_FORGET_ALL",
          "API_MODELS", "API_MODELS_DOWNLOAD", "API_MODELS_DOWNLOAD_CANCEL",
          "API_PLAN", "API_REFERENCES", "API_REWRITE", "API_REWRITE_SETTINGS",
          "API_REWRITE_SETTINGS_TEST", "API_STATUS"]
@@ -3132,13 +3140,14 @@ STATUS_VARS = ("MODELS_MISSING", "INVALID", "REWRITE_BLOCK_KEYS",
                "MAX_REFERENCE_BYTES", "BODY_TOO_LARGE", "UNSUPPORTED_BODY",
                "apiConnected", "generationConnected", "submittingJob",
                "jobCache", "modelsMissingBlocked", "modelsBannerDismissed",
-               "statusSeq")
+               "statusSeq", "currentUser", "TYPED_ERROR_SENTENCES")
 
 STATUS_FNS = ("readBodyLimited", "apiRequest", "containsId", "hasAnyValue",
               "parseManifestCore", "blockersExact",
               "parseRewriteSettingsPointer", "parseRewriteBackends",
               "parseRewriteActiveByTask", "parseRewriteBlock", "parseStatus",
-              "statusUnrecognizedText", "updateGenerate", "renderChip",
+              "statusUnrecognizedText", "jobTerminal", "ownActiveJob",
+              "updateGenerate", "renderChip",
               "renderModelsBanner", "checkStatus")
 
 _STATUS_HARNESS = """// Built by tests/test_web_static.py: the real status handler, run over the
@@ -3160,6 +3169,9 @@ function $(id) { return ELEMENTS[id]; }
 function setApiAvailable(value) { apiConnected = value; }
 function setRewriterState(block) {}
 function refreshJobs() { return Promise.resolve(null); }
+// The identity block's own renderer has its own section (remote-user UI): here
+// it must not touch a page this harness does not build.
+function applyUserState(status) {}
 
 function fetch(url, opts) {
   return Promise.resolve({

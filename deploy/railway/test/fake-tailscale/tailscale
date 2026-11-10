@@ -1,0 +1,76 @@
+#!/usr/bin/env node
+// Stand-in for the tailscale CLI, for the local smoke test only.
+//
+// The entrypoint only runs `tailscale up` and a `--version`-free status path,
+// so that is all this implements. `up` creates the marker the fake daemon reads
+// to report BackendState=Running, after checking the arguments the entrypoint
+// promises to pass.
+//
+// FAKE_TAILSCALE_FAIL_UP=1 makes `up` fail, so the smoke test can prove the
+// entrypoint reports a bad key instead of starting a half-broken stack.
+
+const fs = require("node:fs");
+const path = require("node:path");
+
+const args = process.argv.slice(2);
+
+function flagValue(name) {
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (arg === name) {
+      return args[index + 1] ?? "";
+    }
+    if (arg.startsWith(name + "=")) {
+      return arg.slice(name.length + 1);
+    }
+  }
+  return null;
+}
+
+const socket = flagValue("--socket");
+if (!socket) {
+  console.error("fake-tailscale: --socket is required");
+  process.exit(2);
+}
+
+const command = args.find((arg) => !arg.startsWith("-")) || "";
+
+if (command === "up") {
+  if (process.env.FAKE_TAILSCALE_FAIL_UP === "1") {
+    console.error("backend error: invalid key: unable to validate API key");
+    process.exit(1);
+  }
+  const authkey = flagValue("--authkey");
+  const hostname = flagValue("--hostname");
+  if (!authkey) {
+    console.error("fake-tailscale: up needs --authkey");
+    process.exit(1);
+  }
+  if (!hostname) {
+    console.error("fake-tailscale: up needs --hostname");
+    process.exit(1);
+  }
+  if (!args.includes("--reset")) {
+    // The real CLI refuses a partial flag set without --reset; so must the fake,
+    // or the smoke test would not catch that regression.
+    console.error("fake-tailscale: a partial flag set needs --reset");
+    process.exit(1);
+  }
+  if (flagValue("--advertise-tags") !== null) {
+    console.error("fake-tailscale: the tag comes from the key, not the flag");
+    process.exit(1);
+  }
+  fs.writeFileSync(socket + ".up", JSON.stringify({
+    authkeyLength: authkey.length,
+    hostname,
+    at: new Date().toISOString(),
+  }));
+  process.exit(0);
+}
+
+if (command === "status") {
+  process.exit(0);
+}
+
+console.error(`fake-tailscale: unsupported command ${JSON.stringify(command)}`);
+process.exit(2);

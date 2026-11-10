@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="original">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Lightseed Studio is offline</title>
+<!-- Self-contained: no CDN, no external fonts, no analytics. The logo is
+     inlined by the gateway from assets/lightseed-logo-on-dark.svg. -->
+<style>
+  :root {
+    --bg: #16181b;
+    --bg-panel: #1d2024;
+    --border: #33383f;
+    --text: #e9e7e2;
+    --text-muted: #9ba1a9;
+    --accent: #7C8CFF;
+    --radius: 8px;
+    --font: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue",
+            Arial, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font);
+    font-size: 16px;
+    line-height: 1.55;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+  }
+  main {
+    width: 100%;
+    max-width: 520px;
+    background: var(--bg-panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 32px;
+    text-align: center;
+  }
+  .logo { margin: 0 auto 24px; max-width: 260px; }
+  .logo svg { display: block; width: 100%; height: auto; }
+  h1 {
+    margin: 0 0 12px;
+    font-size: 24px;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+  }
+  p { margin: 0 0 12px; color: var(--text-muted); }
+  p:last-child { margin-bottom: 0; }
+  .hint {
+    margin-top: 24px;
+    padding-top: 16px;
+    border-top: 1px solid var(--border);
+    font-size: 14px;
+  }
+  .retry {
+    display: inline-block;
+    margin-top: 20px;
+    padding: 10px 20px;
+    border: 1px solid var(--accent);
+    border-radius: var(--radius);
+    color: var(--accent);
+    text-decoration: none;
+    font-size: 14px;
+    font-weight: 600;
+  }
+  .retry:hover, .retry:focus-visible { background: rgba(124, 140, 255, 0.12); }
+  footer {
+    margin-top: 20px;
+    font-size: 12px;
+    color: var(--text-muted);
+    text-align: center;
+  }
+  code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12px;
+  }
+</style>
+</head>
+<body>
+<main>
+  <div class="logo">{{LOGO}}</div>
+  <h1>Lightseed Studio is offline</h1>
+  <p>The image server is switched off. Try again later.</p>
+  <p class="hint">Nothing was generated and nothing was lost: your images stay on the
+    owner's PC, which has to be awake and connected for the studio to work.</p>
+  <a class="retry" href="/">Try again</a>
+</main>
+<footer>
+  <div>Lightseed Studio <code>{{VERSION}}</code></div>
+</footer>
+</body>
+</html>

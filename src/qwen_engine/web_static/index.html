@@ -28,9 +28,18 @@
     <a href="#create" id="nav-create" class="nav-link" aria-current="page">Create</a>
     <a href="#history" id="nav-history" class="nav-link">History</a>
     <a href="#settings" id="nav-settings" class="nav-link">Settings</a>
+    <!-- Local listener only: the status document reports admin: true there,
+         so a remote page never offers a tab whose writes would 404. -->
+    <a href="#admin" id="nav-admin" class="nav-link" hidden>Admin</a>
     <a href="#help" id="nav-help" class="nav-link">Help</a>
   </nav>
   <div class="header-right">
+    <!-- Remote only: who is signed in, and the proxy's own sign-out. Both stay
+         hidden on the owner's page, which has no account to name. -->
+    <p class="identity" id="identity" hidden>
+      <span id="identity-name"></span>
+      <a class="identity-sign-out" id="sign-out" href="/oauth2/sign_out">Sign out</a>
+    </p>
     <div class="theme-picker">
       <label for="theme-select">Theme</label>
       <select id="theme-select" aria-describedby="theme-help">
@@ -134,6 +143,8 @@
             </div>
 
             <div class="actions job-actions">
+              <p class="history-cap-warning" id="history-cap-warning" hidden
+                 role="status"></p>
               <p class="memory-warning" id="memory-warning" role="status" hidden></p>
               <div class="generate-button-row">
                 <button type="submit" id="generate-btn" class="btn-primary btn-generate"
@@ -149,6 +160,7 @@
               </div>
               <p class="disabled-reason" id="generate-reason" role="status"></p>
               <p id="job-feedback" class="job-feedback" role="status" aria-live="polite">Ready to submit a generation.</p>
+              <p class="job-queue" id="job-queue" role="status" hidden></p>
               <div class="progress-card" id="job-progress-panel" hidden>
                 <div class="progress-header">
                   <span class="progress-title">
@@ -958,7 +970,113 @@
     </div>
   </section>
 
+  <!-- ===================== Admin view (local listener only) =====================
+       Shown only when the status document says admin: true — a remote page
+       never sees this tab or its routes. Every write answers with the WHOLE
+       refreshed document and the table below is rebuilt from it, so a tick
+       shown here is a permission the server's file holds. The remove
+       confirmation lives in the page (never alert()/confirm()), and its tick
+       box is the only thing that authorizes deleting an account's files. -->
+  <section id="view-admin" class="view" hidden aria-labelledby="admin-heading">
+    <div class="page-container">
+      <div class="page-header">
+        <h2 id="admin-heading" tabindex="-1">Admin</h2>
+        <p class="help admin-shared">Accounts for this server. Changes are saved
+          as soon as you make them: a tick box writes through, and Add and Remove
+          take effect immediately.</p>
+      </div>
+
+      <div class="control-card admin-card">
+        <div class="card-content">
+          <table class="admin-table" id="admin-table">
+            <caption class="visually-hidden">Invited users</caption>
+            <thead>
+              <tr>
+                <th scope="col">Email</th>
+                <th scope="col">Name</th>
+                <th scope="col">First sign-in</th>
+                <th scope="col">Images</th>
+                <th scope="col">Queued or running</th>
+                <th scope="col">Permissions</th>
+                <th scope="col"><span class="visually-hidden">Remove</span></th>
+              </tr>
+            </thead>
+            <tbody id="admin-users-body"></tbody>
+          </table>
+          <p class="help admin-empty" id="admin-empty" hidden>No accounts are
+            invited yet. Add one below.</p>
+          <p class="help admin-cap" id="admin-cap"></p>
+        </div>
+      </div>
+
+      <section class="admin-add control-card" aria-labelledby="admin-add-heading">
+        <header class="card-header">
+          <h3 id="admin-add-heading" class="card-title">Add a user</h3>
+        </header>
+        <div class="card-content">
+          <form id="admin-add-form" novalidate>
+            <div class="field">
+              <label for="admin-add-email">Email address</label>
+              <input type="email" id="admin-add-email" autocomplete="off"
+                     spellcheck="false" aria-describedby="admin-add-help admin-error">
+              <p class="help" id="admin-add-help">The address they sign in with.
+                A new account starts with q8 only; tick the other permissions
+                above afterwards.</p>
+            </div>
+            <div class="field">
+              <label for="admin-add-name">Display name (optional)</label>
+              <input type="text" id="admin-add-name" autocomplete="off"
+                     maxlength="80" aria-describedby="admin-name-help admin-error">
+              <p class="help" id="admin-name-help">Shown instead of the address in
+                their header. Leave empty to show the address.</p>
+            </div>
+            <div class="settings-actions">
+              <button type="submit" id="admin-add-submit" class="btn-primary"
+                      disabled>Add user</button>
+            </div>
+          </form>
+        </div>
+      </section>
+
+      <div class="admin-remove" id="admin-remove-confirm" role="group"
+           aria-labelledby="admin-remove-question" hidden>
+        <p class="admin-remove-question" id="admin-remove-question" tabindex="-1"></p>
+        <div class="field checkbox-field">
+          <input type="checkbox" id="admin-delete-data" autocomplete="off"
+                 aria-describedby="admin-delete-data-help">
+          <label for="admin-delete-data">Also delete their images and references</label>
+        </div>
+        <p class="help" id="admin-delete-data-help">Unticked, their finished
+          images and uploaded references stay on disk but leave their history.
+          Ticked, both are deleted with the account.</p>
+        <div class="history-confirm-buttons">
+          <button type="button" id="admin-remove-yes" class="btn-danger">Remove
+            user</button>
+          <button type="button" id="admin-remove-cancel" class="btn-secondary">Cancel</button>
+        </div>
+      </div>
+      <p class="error" id="admin-error" aria-live="polite"></p>
+      <p class="admin-status" id="admin-status" role="status" aria-live="polite"
+         hidden></p>
+      <p><a class="back-link" href="#create">← Back to Create</a></p>
+    </div>
+  </section>
+
 </main>
+
+<!-- Remote only, and only for an account the owner has not invited: the
+     whole studio is replaced, because there is no subset of it this person
+     may use. Kept outside <main> so hiding the studio cannot leave a stray
+     heading behind. -->
+<section class="not-invited" id="not-invited" hidden
+         aria-labelledby="not-invited-heading">
+  <h2 id="not-invited-heading" tabindex="-1">This account isn't invited</h2>
+  <p>You are signed in as <span id="not-invited-email"></span>, but this
+    studio has no place for that account yet. Ask the owner to invite you,
+    then reload this page.</p>
+  <p><a class="identity-sign-out" id="not-invited-sign-out"
+        href="/oauth2/sign_out">Sign out</a></p>
+</section>
 
 <script src="app.js" defer></script>
 </body>

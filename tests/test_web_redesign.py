@@ -6,8 +6,8 @@ functions from app.js verbatim and drives them over a DOM built from the real
 index.html markup:
 
 * the 1K/2K tabs must follow the selected preset by ANY route (a tile,
-  Random, an import, an "Apply ratio" hint) and must not offer a tier whose
-  group the page has hidden;
+  Random, an import, an "Apply ratio" hint) and must not offer a tier the
+  server withheld from a remote account;
 * the character counter must agree with the same Python-strip semantics the
   "prompt is required" validation uses;
 * an info popover must open on click, close on a click outside, and close on
@@ -114,7 +114,7 @@ def test_every_pre_redesign_id_survives():
             encoding="utf-8").splitlines()
         if line.strip() and not line.startswith("#")
     }
-    assert len(before) > 200, "the fixture must list the whole pre-redesign page"
+    assert len(before) > 250, "the fixture must list the whole pre-redesign page"
     now = set(re.findall(r'id="([^"]+)"', _read("index.html")))
     assert not (before - now), sorted(before - now)
 
@@ -534,7 +534,7 @@ def test_a_hand_typed_size_keeps_the_tier_on_screen(tmp_path):
 
 
 def test_a_withheld_tier_cannot_be_shown_or_selected(tmp_path):
-    """With the 2K group hidden, the 2K grid must not be reachable at all."""
+    """A remote account without 2K must not reach the 2K grid at all."""
     cases = [
         {"kind": "tier", "denied": True, "width": 1024, "height": 1024},
         {"kind": "tier", "denied": True, "width": 1024, "height": 1024,
@@ -753,7 +753,7 @@ def test_every_nav_link_routes_to_a_real_view():
     views = _js_var(js, "VIEWS")
     headings = _js_var(js, "VIEW_HEADINGS")
     links = re.findall(r'<a href="#(\w+)" id="nav-\w+"[^>]*>', html)
-    assert sorted(links) == ["create", "help", "history", "settings"]
+    assert sorted(links) == ["admin", "create", "help", "history", "settings"]
     for name in links:
         # The map is quoted with single quotes in app.js, so match either.
         entry = re.search(rf"\b{name}:\s*['\"]([\w-]+)['\"]", views)

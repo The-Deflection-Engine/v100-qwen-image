@@ -709,6 +709,10 @@ def test_generate_is_gated_while_the_required_assets_are_missing(tree):
     assert api.MODELS_MISSING in payload["generation_blockers"]
     assert payload["generation_available"] is False
     assert set(payload["gates"]) == set(api._gates())
+    # The runtime document is exactly what it always was: C5's version and C4's
+    # admin flag are supplied by the LISTENER (the local and remote routes),
+    # never baked in here — that keeps ``status_response`` pure and the schema
+    # tag un-bumped.
     assert set(payload) == {"schema", "planning_available",
                             "generation_available", "gates", "manifest",
                             "generation_blockers", "rewrite"}

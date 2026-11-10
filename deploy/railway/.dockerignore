@@ -1,0 +1,14 @@
+# Build context for deploy/railway. Keep it tiny: the Dockerfile downloads the
+# two pinned binaries and copies only the gateway, pages, templates and assets.
+*
+!gateway.js
+!entrypoint.sh
+!oauth2-proxy.args
+!pages/**
+!templates/**
+!assets/**
+
+# Never in an image or a build cache.
+**/.env
+**/*.pem
+**/*.key

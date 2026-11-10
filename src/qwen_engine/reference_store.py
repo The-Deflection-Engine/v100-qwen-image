@@ -34,11 +34,13 @@ import json
 import os
 import re
 import stat
+import tempfile
 import threading
 from pathlib import Path
 from typing import Any
 
 from qwen_engine.errors import EngineError
+from qwen_engine.owners import OwnerError, check_owner, is_owner
 
 #: Schema tag of the sidecar document.
 REFERENCE_SIDECAR_SCHEMA = "qwen_engine.reference_sidecar.v1"
@@ -59,6 +61,17 @@ SIDECAR_SUFFIX = ".json"
 THUMB_SUFFIX = ".thumb.png"
 
 _ID_RE = re.compile(r"[0-9a-f]{64}\Z")
+
+#: Per-owner index of which content ids that account uploaded. Blobs stay
+#: content-addressed and deduplicated across owners; this file only records
+#: the visibility edges, so removing one user never deletes bytes another
+#: user still references.
+OWNERS_SCHEMA = "qwen_engine.reference_owners.v1"
+OWNERS_FILENAME = "owners.json"
+#: One id may carry at most this many owner edges (a bounded document).
+MAX_OWNERS_PER_ID = 32
+MAX_OWNERS_BYTES = 1024 * 1024
+_OWNERS_KEYS = frozenset({"schema", "owners"})
 
 _MAGIC = (
     (b"\x89PNG\r\n\x1a\n", "png"),
@@ -83,6 +96,15 @@ def _check_id(value: Any) -> str:
         raise ReferenceStoreError(
             f"reference id must be a lowercase 64-hex sha256, got {value!r}")
     return value
+
+
+def _check_owner(value: Any) -> str:
+    """One owner id, validated by the shared grammar, refused in store terms."""
+    try:
+        return check_owner(value)
+    except OwnerError:
+        raise ReferenceStoreError(
+            "reference owner must be a bounded printable string without whitespace") from None
 
 
 def sniff_format(raw: bytes) -> str:
@@ -378,3 +400,181 @@ def list_ids(root: str | os.PathLike) -> tuple[str, ...]:
 def usage(root: str | os.PathLike) -> tuple[int, int]:
     """(blob_count, total_bytes) of owned blobs — for status surfaces."""
     return _usage(_canonical_root(root))
+
+
+# --------------------------------------------------------------------------
+# Per-owner index (who may see which content id)
+# --------------------------------------------------------------------------
+
+def _owners_path(base_dir: Path) -> Path:
+    return base_dir / OWNERS_FILENAME
+
+
+def _read_owners(base_dir: Path) -> dict[str, tuple[str, ...]]:
+    """Load and strictly validate the owner index; ``{id: (owner, ...)}``.
+
+    A missing file is an empty index (no uploads yet). A file that exists but
+    does not match the schema is a typed refusal: silently treating corruption
+    as "no owners" would either hide every upload or, worse, make a later
+    prune delete blobs somebody still owns.
+    """
+    path = _owners_path(base_dir)
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return {}
+    except OSError as exc:
+        raise ReferenceStoreError(
+            f"reference owner index cannot be read ({exc.strerror or 'storage error'})") from None
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise ReferenceStoreError("reference owner index is not a regular file")
+    if info.st_size > MAX_OWNERS_BYTES:
+        raise ReferenceStoreError("reference owner index exceeds its bounded size")
+    raw = _read_limited_bytes(path, MAX_OWNERS_BYTES, "reference owner index")
+    try:
+        document = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        raise ReferenceStoreError("reference owner index is not UTF-8 JSON") from None
+    if type(document) is not dict or set(document) != _OWNERS_KEYS:
+        raise ReferenceStoreError("reference owner index has an unexpected field set")
+    if document["schema"] != OWNERS_SCHEMA:
+        raise ReferenceStoreError("reference owner index schema is unknown")
+    stored = document["owners"]
+    if type(stored) is not dict:
+        raise ReferenceStoreError("reference owner index is not an object map")
+    owners: dict[str, tuple[str, ...]] = {}
+    for reference_id, listed in stored.items():
+        if not is_reference_id(reference_id):
+            raise ReferenceStoreError("reference owner index carries a malformed id")
+        if (type(listed) is not list or not 1 <= len(listed) <= MAX_OWNERS_PER_ID
+                or any(not is_owner(owner) for owner in listed)
+                or len(set(listed)) != len(listed)):
+            raise ReferenceStoreError("reference owner index carries a malformed owner list")
+        owners[reference_id] = tuple(sorted(listed))
+    return owners
+
+
+def _write_owners(base_dir: Path, owners: dict[str, tuple[str, ...]]) -> None:
+    """Replace the owner index atomically, 0600, then let the caller adopt it.
+
+    Temp file plus ``os.replace`` in the same directory: a crash mid-write
+    leaves the previous index intact rather than a half-document that the
+    loader would (correctly) refuse.
+    """
+    payload = json.dumps({"schema": OWNERS_SCHEMA,
+                          "owners": {reference_id: list(listed)
+                                     for reference_id, listed in sorted(owners.items())}},
+                         sort_keys=True).encode("utf-8")
+    if len(payload) > MAX_OWNERS_BYTES:
+        raise ReferenceStoreError("reference owner index exceeds its bounded size")
+    descriptor, temp_path = tempfile.mkstemp(prefix=".owners-", suffix=".tmp", dir=base_dir)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temp_path, 0o600)
+        os.replace(temp_path, _owners_path(base_dir))
+    except OSError as exc:
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+        raise ReferenceStoreError(
+            f"reference owner index cannot be written ({exc.strerror or 'storage error'})") from None
+    except BaseException:
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+        raise
+
+
+def add_owner(root: str | os.PathLike, owner: str, reference_id: str) -> None:
+    """Record that ``owner`` may reference ``reference_id`` (idempotent).
+
+    The blob must already exist: an ownership edge to bytes the store does not
+    hold would let a later prune look for files that were never there.
+    """
+    base_dir = _canonical_root(root)
+    listed = _check_owner(owner)
+    _check_id(reference_id)
+    with _STORE_LOCK:
+        if not (base_dir / (reference_id + BLOB_SUFFIX)).exists():
+            raise ReferenceStoreError("reference id is not stored")
+        owners = _read_owners(base_dir)
+        current = owners.get(reference_id, ())
+        if listed in current:
+            return
+        if len(current) >= MAX_OWNERS_PER_ID:
+            raise ReferenceStoreError(
+                f"reference id already has {MAX_OWNERS_PER_ID} owners; an operator must prune it")
+        owners[reference_id] = tuple(sorted(current + (listed,)))
+        _write_owners(base_dir, owners)
+
+
+def owners_for(root: str | os.PathLike, reference_id: str) -> tuple[str, ...]:
+    """Owners of one stored id (empty when the index has no edge yet)."""
+    base_dir = _canonical_root(root)
+    _check_id(reference_id)
+    with _STORE_LOCK:
+        return _read_owners(base_dir).get(reference_id, ())
+
+
+def owner_ids(root: str | os.PathLike, owner: str) -> tuple[str, ...]:
+    """Stored ids this owner uploaded — the only ones their UI may reference."""
+    base_dir = _canonical_root(root)
+    listed = _check_owner(owner)
+    with _STORE_LOCK:
+        return tuple(sorted(reference_id for reference_id, holders in _read_owners(base_dir).items()
+                            if listed in holders
+                            and (base_dir / (reference_id + BLOB_SUFFIX)).exists()))
+
+
+def forget_owner(root: str | os.PathLike, owner: str) -> tuple[tuple[str, ...], int]:
+    """Drop every index edge of one owner; ``(released_ids, deleted_files)``.
+
+    Files are deleted ONLY for ids no other owner still holds — the store is
+    shared and content-addressed, so two accounts uploading identical bytes
+    own one blob. ``released_ids`` is every id the owner had an edge to, so a
+    caller can tell what stopped being theirs from what actually left the disk.
+    """
+    base_dir = _canonical_root(root)
+    listed = _check_owner(owner)
+    with _STORE_LOCK:
+        owners = _read_owners(base_dir)
+        released = tuple(sorted(reference_id for reference_id, holders in owners.items()
+                                if listed in holders))
+        if not released:
+            return (), 0
+        deleted = 0
+        for reference_id in released:
+            remaining = tuple(h for h in owners[reference_id] if h != listed)
+            if remaining:
+                owners[reference_id] = remaining
+                continue
+            del owners[reference_id]
+            deleted += _delete_reference_files(base_dir, reference_id)
+        _write_owners(base_dir, owners)
+        return released, deleted
+
+
+def _delete_reference_files(base_dir: Path, reference_id: str) -> int:
+    """Delete one unowned id's blob, sidecar and thumbnail by name.
+
+    Every entry is unlinked as a name inside the canonical root, so a replaced
+    symlink is removed as a link (never followed) and only these three known
+    suffixes are ever touched. Missing files are not an error — a prune must be
+    able to finish after an operator removed a blob by hand.
+    """
+    deleted = 0
+    for suffix in (BLOB_SUFFIX, SIDECAR_SUFFIX, THUMB_SUFFIX):
+        try:
+            os.unlink(base_dir / (reference_id + suffix))
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise ReferenceStoreError(
+                f"reference files cannot be deleted ({exc.strerror or 'storage error'})") from None
+        deleted += 1
+    return deleted

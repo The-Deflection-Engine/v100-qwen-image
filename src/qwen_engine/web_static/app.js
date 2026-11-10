@@ -79,6 +79,44 @@
   var MODELS_DOWNLOAD_REQUEST_SCHEMA =
     'qwen_engine.web_models_download_request.v1';
   var UI_HEADER = 'X-Qwen-UI';
+  // C4: the LOCAL-only Admin page. One document in, the whole refreshed
+  // document back; every one of these routes answers 404 on the remote
+  // listener, which is exactly why the tab is shown only when the status
+  // document says `admin: true` — a tab whose writes would 404 is a lie.
+  var API_ADMIN_USERS = '/api/v1/admin/users';
+  var API_ADMIN_ADD = API_ADMIN_USERS + '/add';
+  var API_ADMIN_REMOVE = API_ADMIN_USERS + '/remove';
+  var API_ADMIN_PERMISSIONS = API_ADMIN_USERS + '/permissions';
+  var API_ADMIN_DISPLAY_NAME = API_ADMIN_USERS + '/display-name';
+  var ADMIN_SCHEMA = 'qwen_engine.web_admin.v1';
+  var ADMIN_ADD_REQUEST_SCHEMA = 'qwen_engine.web_admin_add.v1';
+  var ADMIN_REMOVE_REQUEST_SCHEMA = 'qwen_engine.web_admin_remove.v1';
+  var ADMIN_PERMISSIONS_REQUEST_SCHEMA = 'qwen_engine.web_admin_permissions.v1';
+  var ADMIN_DISPLAY_NAME_REQUEST_SCHEMA = 'qwen_engine.web_admin_display_name.v1';
+  // Closed key sets, mirroring web/admin.py: an unknown key rejects the
+  // document rather than being silently ignored.
+  var ADMIN_DOCUMENT_KEYS = ['schema', 'cap', 'users'];
+  var ADMIN_USER_KEYS = ['email', 'display_name', 'invited', 'first_sign_in',
+                         'signed_in', 'history', 'active', 'allow'];
+  // Which of those keys are text and which are counters: the parser checks
+  // every key's TYPE, so the two groups are named once instead of twice.
+  var ADMIN_TEXT_KEYS = ['display_name', 'invited'];
+  var ADMIN_COUNT_KEYS = ['history', 'active'];
+  // The four permission flags, in the order the table shows them.
+  var PERMISSION_KEYS = ['q8', '2k', 'edit', 'official_enhancer'];
+  var PERMISSION_LABELS = {
+    q8: 'Q8', '2k': '2K sizes', edit: 'Image editing',
+    official_enhancer: 'Official prompt enhancer'
+  };
+  var MAX_ADMIN_USERS = 500;
+  // The remote-user identity block (C3). Closed: exactly these keys, the four
+  // flags, one history pair. It is absent on the owner's own page, which is
+  // what keeps that page unchanged.
+  var USER_BLOCK_KEYS = ['email', 'display_name', 'allow', 'history'];
+  var USER_HISTORY_KEYS = ['count', 'cap'];
+  var USER_HISTORY_OPTIONAL_KEYS = ['will_replace_oldest'];
+  // The only link a remote user needs to leave: the proxy's own sign-out.
+  var SIGN_OUT_HREF = '/oauth2/sign_out';
 
   // Reference images (design §5). The caps MIRROR the server contract
   // (config.py REF_MAX = 10, reference_store.MAX_REFERENCE_BYTES = 32 MiB,
@@ -379,9 +417,11 @@
   // Help is a view like the others: the markup ships #view-help and a
   // #nav-help link, so leaving it out of this map made the tab a dead link.
   var VIEWS = { create: 'view-create', history: 'view-history',
-                settings: 'view-settings', help: 'view-help' };
+                settings: 'view-settings', admin: 'view-admin',
+                help: 'view-help' };
   var VIEW_HEADINGS = { create: 'create-heading', history: 'history-heading',
-                        settings: 'settings-heading', help: 'help-heading' };
+                        settings: 'settings-heading', admin: 'admin-heading',
+                        help: 'help-heading' };
 
   function $(id) { return document.getElementById(id); }
 
@@ -822,6 +862,17 @@
   // an old success must not re-enable planning after a newer disconnect,
   // and an old failure must not disable a newer valid connection.
   var statusSeq = 0;
+  // C3/C4 UI state, set only from a RECOGNIZED status document: whether this
+  // page is the owner's own (admin tab offered, every control enabled) or an
+  // invited remote user's (a closed subset), and who that user is.
+  var adminEnabled = false;
+  var currentUser = null;
+  var serverVersion = null;
+  // The admin page's own state: the last document the server sent, whether a
+  // write is in flight, and the account the in-page remove confirmation names.
+  var adminDoc = null;
+  var adminBusy = false;
+  var adminRemoveTarget = null;
 
   var BODY_TOO_LARGE = { bodyTooLarge: true };
   // Fail-closed marker: when the readable-stream API is unavailable the
@@ -999,11 +1050,93 @@
     // the rewriter (never a guessed backend).
     var rewrite = parseRewriteBlock(s.rewrite);
     if (rewrite === INVALID) return null;
+    // C4/C5 additions, each OPTIONAL and additive: a server that never heard
+    // of remote users omits all three and its page is byte-for-byte the one
+    // the owner has always had. Once present each is checked in full — a
+    // widened, partial or mistyped block rejects the WHOLE document, because
+    // half an identity would hide the wrong controls.
+    var admin = false;
+    if (s.admin !== undefined) {
+      if (typeof s.admin !== 'boolean') return null;
+      admin = s.admin;
+    }
+    var serverVersion = null;
+    if (s.server_version !== undefined) {
+      if (typeof s.server_version !== 'string' || !s.server_version ||
+          s.server_version.length > 64) return null;
+      serverVersion = s.server_version;
+    }
+    var user = null;
+    if (s.user !== undefined) {
+      user = parseUserBlock(s.user);
+      if (user === INVALID) return null;
+    }
     return { recognized: true, planning: true, generation: s.generation_available,
              // Derived, not a wire key: the banner needs to know WHICH blocker
              // it is answering, and the list above is already validated closed.
              models_missing: s.generation_blockers.indexOf(MODELS_MISSING) !== -1,
-             rewrite: rewrite };
+             rewrite: rewrite, admin: admin, serverVersion: serverVersion,
+             user: user };
+  }
+
+  /* The remote identity block (C3): who is signed in, what they may use, and
+     how much history they hold. Closed over four keys — an identity that does
+     not say exactly which four features it grants is an identity whose page
+     would hide the wrong controls, so it is refused whole rather than
+     half-trusted. The email is the proxy's own claim (already lowercased by
+     the proxy, checked again here), never a display string this page builds. */
+  function parseUserBlock(block) {
+    if (!block || typeof block !== 'object' || Array.isArray(block)) return INVALID;
+    var keys = Object.keys(block);
+    if (keys.length !== USER_BLOCK_KEYS.length) return INVALID;
+    for (var i = 0; i < keys.length; i++) {
+      if (USER_BLOCK_KEYS.indexOf(keys[i]) === -1) return INVALID;
+    }
+    var email = block.email;
+    if (typeof email !== 'string' || !email || email.length > 254) return INVALID;
+    if (/[\s\u0000-\u001f\u007f]/.test(email)) return INVALID;
+    if (email !== email.toLowerCase()) return INVALID;   // the proxy lowercases
+    if (email.indexOf('@') === -1) return INVALID;
+    var name = block.display_name;
+    if (typeof name !== 'string' || name.length > 80) return INVALID;
+    var allow = block.allow;
+    if (!allow || typeof allow !== 'object' || Array.isArray(allow)) return INVALID;
+    if (Object.keys(allow).length !== PERMISSION_KEYS.length) return INVALID;
+    var flags = {};
+    for (var p = 0; p < PERMISSION_KEYS.length; p++) {
+      var flag = allow[PERMISSION_KEYS[p]];
+      if (typeof flag !== 'boolean') return INVALID;
+      flags[PERMISSION_KEYS[p]] = flag;
+    }
+    var history = block.history;
+    if (!history || typeof history !== 'object' || Array.isArray(history)) return INVALID;
+    var historyKeys = Object.keys(history);
+    for (var h = 0; h < historyKeys.length; h++) {
+      if (USER_HISTORY_KEYS.indexOf(historyKeys[h]) === -1 &&
+          USER_HISTORY_OPTIONAL_KEYS.indexOf(historyKeys[h]) === -1) return INVALID;
+    }
+    for (var r = 0; r < USER_HISTORY_KEYS.length; r++) {
+      if (!Object.prototype.hasOwnProperty.call(history, USER_HISTORY_KEYS[r])) {
+        return INVALID;
+      }
+    }
+    if (!Number.isInteger(history.count) || !Number.isInteger(history.cap)) return INVALID;
+    // The plan's richer form says outright whether the next generation
+    // replaces the oldest one. When a server sends it, it decides the warning;
+    // when it does not, the page compares the two numbers itself.
+    var replaces = null;
+    if (history.will_replace_oldest !== undefined) {
+      if (typeof history.will_replace_oldest !== 'boolean') return INVALID;
+      replaces = history.will_replace_oldest;
+    }
+    // The cap is the server's number, quoted: the page warns at it and never
+    // invents a different one. A count above the cap is a document this server
+    // cannot produce (the sixth job deletes the oldest), so it is refused.
+    if (history.cap < 1 || history.cap > 100) return INVALID;
+    if (history.count < 0 || history.count > history.cap) return INVALID;
+    return { email: email, displayName: name, allow: flags,
+             history: { count: history.count, cap: history.cap,
+                        willReplaceOldest: replaces } };
   }
 
   /* The rewrite availability, strictly. `undefined` (absent) and the disabled
@@ -1219,6 +1352,16 @@
           return null;
         }
         if (!r.res.ok) {
+          // A remote account the owner has not invited is refused HERE, by
+          // the status request itself: there is no page for that person to
+          // look at, so the studio is replaced rather than left half-drawn.
+          if (r.json && r.json.schema === ERROR_SCHEMA &&
+              r.json.code === 'not_invited') {
+            setApiAvailable(false);
+            renderChip('Not invited', 'Not invited — ask the owner');
+            showNotInvited();
+            return null;
+          }
           setApiAvailable(false);
           renderChip('Server error', 'Server error (status ' + r.res.status + ')');
           setText('settings-backend',
@@ -1276,6 +1419,10 @@
                      'so Generate stays disabled until Settings → Models has ' +
                      'fetched them.'
                    : ''));
+        // Which controls this page may offer, and who is looking at it. Every
+        // recognized status re-states it, so a browser that signed out, or
+        // whose owner revoked a permission, converges without a reload.
+        applyUserState(status);
         if (status.generation) refreshJobs();
         return status;
       });
@@ -1289,9 +1436,11 @@
     var message = 'The server refused the request (HTTP ' + res.status + ').';
     if (payload && payload.schema === ERROR_SCHEMA &&
         typeof payload.code === 'string' && /^[a-z0-9_]{1,64}$/.test(payload.code)) {
-      message = payload.code + ': ' +
+      // The four refusals a person can ACT on are printed as the sentence
+      // that says what to do: a reworded server string would only repeat it.
+      message = typedErrorSentence(payload.code) || (payload.code + ': ' +
                 (typeof payload.message === 'string'
-                  ? payload.message.slice(0, 200) : 'no message');
+                  ? payload.message.slice(0, 200) : 'no message'));
       if (Array.isArray(payload.fields)) {
         var fieldTexts = [];
         for (var i = 0; i < payload.fields.length && fieldTexts.length < 8; i++) {
@@ -1376,7 +1525,9 @@
       button.disabled = !rewriteAvailable();
     }
     var hint = $('rewrite-hint');
-    if (hint) hint.hidden = rewritingSomewhere();
+    // A remote account cannot choose a rewriter, so the hint pointing at
+    // Settings is never shown to one.
+    if (hint) hint.hidden = rewritingSomewhere() || !!currentUser;
     // Which rewriter is answering is stated, not implied: the two behave
     // differently (one takes the graphics card, one does not), they are chosen
     // separately per draft kind, and the user just chose between them.
@@ -1550,9 +1701,9 @@
     var message = 'The rewriter refused the request (HTTP ' + status + ').';
     if (payload && payload.schema === ERROR_SCHEMA &&
         typeof payload.code === 'string' && /^[a-z0-9_]{1,64}$/.test(payload.code)) {
-      message = payload.code + ': ' +
+      message = typedErrorSentence(payload.code) || (payload.code + ': ' +
         (typeof payload.message === 'string' ? payload.message.slice(0, 200)
-                                            : 'no message');
+                                            : 'no message'));
     }
     setText('rewrite-error', message.slice(0, 400) + ' Your draft is unchanged.');
   }
@@ -3887,6 +4038,508 @@
     }
   }
 
+  /* ---------------- Remote users, typed refusals, and the Admin page ----------------
+   * One listener, two kinds of page. The status document decides which:
+   * `admin: true` means this is the owner's own listener (Admin tab, every
+   * control); a `user` block means an invited person is looking at a closed
+   * subset of the same page. Absent both, the page is exactly the owner's
+   * pre-Railway page — that is what keeps the local UI unchanged.
+   *
+   * Hiding a control is a COURTESY, never the rule: the server refuses a
+   * disallowed feature with `feature_not_allowed` and the page prints that
+   * sentence. Nothing here is trusted for correctness.
+   */
+
+  // Typed refusals the remote listener can send, each with ONE fixed
+  // sentence. A code outside this list keeps the bounded generic message.
+  var TYPED_ERROR_SENTENCES = {
+    not_invited:
+      'This account isn\'t invited — ask the owner to add it.',
+    feature_not_allowed:
+      'Your account does not have that feature — ask the owner to enable it.',
+    queue_limit:
+      'You already have an image generating. Wait for it to finish before ' +
+      'starting another.',
+    rewrite_unavailable:
+      'The prompt rewriter is not available right now. You can still write ' +
+      'the prompt yourself.'
+  };
+
+  function typedErrorSentence(code) {
+    if (typeof code !== 'string') return null;
+    if (!Object.prototype.hasOwnProperty.call(TYPED_ERROR_SENTENCES, code)) {
+      return null;
+    }
+    return TYPED_ERROR_SENTENCES[code];
+  }
+
+  // A remote account the owner has not invited: there is no subset of the
+  // studio this person may use, so the studio is replaced whole. The address
+  // is the proxy's own claim (already validated by parseUserBlock), never
+  // text this page composed.
+  function showNotInvited() {
+    var main = $('main');
+    if (main) main.hidden = true;
+    var panel = $('not-invited');
+    if (!panel) return;
+    panel.hidden = false;
+    if (currentUser) setText('not-invited-email', currentUser.email);
+    var heading = $('not-invited-heading');
+    if (heading) heading.focus();
+  }
+
+  // The whole page follows ONE identity. Called on every recognized status so
+  // a browser that was signed in as someone else (or as nobody) converges.
+  function applyUserState(status) {
+    adminEnabled = !!status.admin;
+    currentUser = status.user || null;
+    if (status.serverVersion) serverVersion = status.serverVersion;
+    var remote = !!currentUser;
+    var allow = remote ? currentUser.allow : null;
+    var allows = function (name) { return !!allow && allow[name] === true; };
+
+    // Admin: the tab exists only where the routes do.
+    var navAdmin = $('nav-admin');
+    if (navAdmin) navAdmin.hidden = !adminEnabled;
+    if (!adminEnabled && activeView === 'admin') renderView('create');
+
+    // Identity: the owner's page has no account to name.
+    var identity = $('identity');
+    if (identity) {
+      identity.hidden = !remote;
+      if (remote) {
+        setText('identity-name',
+                currentUser.displayName || currentUser.email);
+        var signOut = $('sign-out');
+        if (signOut) signOut.setAttribute('href', SIGN_OUT_HREF);
+      }
+    }
+
+    // Create view: the features this account may not use are not offered.
+    hideIf('presets-2k-group', remote && !allows('2k'));
+    // The 1K/2K tab pair is a filter over the same permission, so it goes with
+    // the group it filters. A state-only update: no new call into the preset
+    // module here.
+    hideIf('preset-tier-tabs', remote && !allows('2k'));
+    var editField = $('edit-mode-field');
+    if (editField) {
+      editField.hidden = remote && !allows('edit');
+      if (editField.hidden && $('edit-mode').checked) {
+        $('edit-mode').checked = false;
+        applyEditMode();   // references are kept, but not used
+      }
+    }
+    var q8 = $('quant-q8');
+    if (q8) {
+      var denyQ8 = remote && !allows('q8');
+      q8.hidden = denyQ8;
+      q8.disabled = denyQ8;
+      // A selected-but-hidden option would still show its text in the
+      // closed select, so the draft moves to the value the account may use.
+      if (denyQ8 && $('quant').value === 'q8') {
+        $('quant').value = 'fp16';
+        renderValidation(validateForm().errors);
+        syncPlanStaleness();
+      }
+    }
+
+    // Settings belong to the owner's machine: the server chooses a remote
+    // account's rewriter, so a remote page has no Settings tab at all, and no
+    // link pointing at one.
+    hideIf('nav-settings', remote);
+    hideIf('rewrite-hint', remote || rewritingSomewhere());
+    var changeLinks = document.querySelectorAll('.rewrite-change');
+    for (var c = 0; c < changeLinks.length; c++) changeLinks[c].hidden = remote;
+    if (remote && activeView === 'settings') renderView('create');
+    // Settings writes and model downloads belong to the owner's machine: a
+    // remote page never offers a button whose route answers 404.
+    var writes = document.querySelectorAll('.settings-writes');
+    for (var w = 0; w < writes.length; w++) writes[w].hidden = remote;
+    hideIf('models-controls', remote);
+
+    // The official enhancer needs a Q8 checkpoint on the owner's card: a
+    // remote account without that permission never sees it offered.
+    var peDenied = remote && !allows('official_enhancer');
+    hideIf('rewrite-t2i-pe-option', peDenied);
+    hideIf('rewrite-edit-pe-option', peDenied);
+    hideIf('rewrite-gpu-note', peDenied);
+
+    updateHistoryCapWarning();
+    updateGenerate();
+  }
+
+  function hideIf(id, hidden) {
+    var node = $(id);
+    if (node) node.hidden = !!hidden;
+  }
+
+  // The cap is the server's number, quoted: the page says what the next
+  // generation will delete and never invents a different limit.
+  function updateHistoryCapWarning() {
+    var node = $('history-cap-warning');
+    if (!node) return;
+    var history = currentUser && currentUser.history;
+    var replaces = !!history && (history.willReplaceOldest !== null
+      ? history.willReplaceOldest
+      : history.count >= history.cap);
+    if (!replaces) {
+      node.hidden = true;
+      node.textContent = '';
+      return;
+    }
+    node.textContent = 'You have ' + history.count + ' saved ' +
+      (history.count === 1 ? 'image' : 'images') + '. Generating another ' +
+      'will permanently delete your oldest one.';
+    node.hidden = false;
+  }
+
+  /* ---- Admin page (local listener only) ---- */
+
+  function parseAdminDocument(doc) {
+    if (!doc || typeof doc !== 'object' || Array.isArray(doc)) return INVALID;
+    var keys = Object.keys(doc);
+    if (keys.length !== ADMIN_DOCUMENT_KEYS.length) return INVALID;
+    for (var i = 0; i < keys.length; i++) {
+      if (ADMIN_DOCUMENT_KEYS.indexOf(keys[i]) === -1) return INVALID;
+    }
+    if (doc.schema !== ADMIN_SCHEMA) return INVALID;
+    if (!Number.isInteger(doc.cap) || doc.cap < 1) return INVALID;
+    if (!Array.isArray(doc.users) || doc.users.length > MAX_ADMIN_USERS) {
+      return INVALID;
+    }
+    var seen = Object.create(null);
+    var rows = [];
+    for (var u = 0; u < doc.users.length; u++) {
+      var row = parseAdminUserRow(doc.users[u]);
+      if (row === INVALID) return INVALID;
+      if (seen[row.email]) return INVALID;   // one row per account
+      seen[row.email] = true;
+      rows.push(row);
+    }
+    return { schema: doc.schema, cap: doc.cap, users: rows };
+  }
+
+  function parseAdminUserRow(row) {
+    if (!row || typeof row !== 'object' || Array.isArray(row)) return INVALID;
+    var keys = Object.keys(row);
+    if (keys.length !== ADMIN_USER_KEYS.length) return INVALID;
+    for (var i = 0; i < keys.length; i++) {
+      if (ADMIN_USER_KEYS.indexOf(keys[i]) === -1) return INVALID;
+    }
+    if (typeof row.email !== 'string' || !row.email || row.email.length > 254) {
+      return INVALID;
+    }
+    if (/[\s\u0000-\u001f\u007f]/.test(row.email)) return INVALID;
+    for (var s = 0; s < 2; s++) {
+      var text = row[ADMIN_TEXT_KEYS[s]];
+      if (typeof text !== 'string' || text.length > 254) return INVALID;
+    }
+    if (!(row.first_sign_in === null || typeof row.first_sign_in === 'string')) {
+      return INVALID;
+    }
+    if (typeof row.first_sign_in === 'string' && row.first_sign_in.length > 64) {
+      return INVALID;
+    }
+    if (typeof row.signed_in !== 'boolean') return INVALID;
+    for (var n = 0; n < 2; n++) {
+      var count = row[ADMIN_COUNT_KEYS[n]];
+      if (!Number.isInteger(count) || count < 0 || count > 1000000) {
+        return INVALID;
+      }
+    }
+    var allow = row.allow;
+    if (!allow || typeof allow !== 'object' || Array.isArray(allow)) return INVALID;
+    if (Object.keys(allow).length !== PERMISSION_KEYS.length) return INVALID;
+    var flags = {};
+    for (var p = 0; p < PERMISSION_KEYS.length; p++) {
+      var flag = allow[PERMISSION_KEYS[p]];
+      if (typeof flag !== 'boolean') return INVALID;
+      flags[PERMISSION_KEYS[p]] = flag;
+    }
+    return { email: row.email, displayName: row.display_name,
+             invited: row.invited, firstSignIn: row.first_sign_in,
+             signedIn: row.signed_in, history: row.history,
+             active: row.active, allow: flags };
+  }
+
+  // When an account first used the page: the store's own stamp when it has
+  // one, else the honest yes/no the sub's presence answers.
+  function adminFirstSignInText(row) {
+    if (typeof row.firstSignIn === 'string' &&
+        /^\d{4}-\d{2}-\d{2}/.test(row.firstSignIn)) {
+      return row.firstSignIn.slice(0, 10);
+    }
+    return row.signedIn ? 'Yes' : 'Not yet';
+  }
+
+  function adminCell(text, className) {
+    var cell = document.createElement('td');
+    cell.textContent = text;
+    if (className) cell.className = className;
+    return cell;
+  }
+
+  function adminButton(label, className, onClick, disabled) {
+    var button = document.createElement('button');
+    button.type = 'button';
+    button.textContent = label;
+    button.className = className;
+    button.disabled = !!disabled;
+    button.addEventListener('click', onClick);
+    return button;
+  }
+
+  // The rows are built from the server's document with createElement and
+  // textContent only: an address is text, never markup.
+  function renderAdminTable(doc) {
+    var body = $('admin-users-body');
+    if (!body) return;
+    body.replaceChildren();
+    var rows = doc ? doc.users : [];
+    for (var i = 0; i < rows.length; i++) {
+      body.appendChild(renderAdminRow(rows[i]));
+    }
+    hideIf('admin-empty', rows.length > 0);
+    setText('admin-cap', doc
+      ? 'Each account keeps its 5 most recent images; a new one replaces the ' +
+        'oldest. ' + rows.length + ' of ' + doc.cap + ' accounts invited.'
+      : '');
+  }
+
+  function renderAdminRow(row) {
+    var tr = document.createElement('tr');
+    tr.dataset.email = row.email;
+    tr.appendChild(adminCell(row.email, 'admin-email'));
+
+    var nameCell = document.createElement('td');
+    var name = document.createElement('input');
+    name.type = 'text';
+    name.className = 'admin-name';
+    name.maxLength = 80;
+    name.value = row.displayName;
+    name.setAttribute('aria-label', 'Display name for ' + row.email);
+    name.addEventListener('change', function () {
+      commitAdminDisplayName(row.email, name);
+    });
+    nameCell.appendChild(name);
+    tr.appendChild(nameCell);
+
+    tr.appendChild(adminCell(adminFirstSignInText(row), 'admin-when'));
+    tr.appendChild(adminCell(String(row.history), 'admin-count'));
+    tr.appendChild(adminCell(String(row.active), 'admin-count'));
+
+    var perms = document.createElement('td');
+    perms.className = 'admin-perms';
+    for (var p = 0; p < PERMISSION_KEYS.length; p++) {
+      perms.appendChild(adminPermissionBox(row, PERMISSION_KEYS[p]));
+    }
+    tr.appendChild(perms);
+
+    var actions = document.createElement('td');
+    actions.appendChild(adminButton('Remove', 'btn-danger admin-remove-btn', function () {
+      beginAdminRemove(row.email);
+    }, adminBusy));
+    tr.appendChild(actions);
+    return tr;
+  }
+
+  function adminPermissionBox(row, key) {
+    var label = document.createElement('label');
+    label.className = 'admin-perm';
+    var box = document.createElement('input');
+    box.type = 'checkbox';
+    box.checked = row.allow[key] === true;
+    box.disabled = adminBusy;
+    box.setAttribute('aria-label',
+      PERMISSION_LABELS[key] + ' for ' + row.email);
+    box.addEventListener('change', function () {
+      commitAdminPermissions(row, key, box);
+    });
+    var text = document.createElement('span');
+    text.textContent = PERMISSION_LABELS[key];
+    label.appendChild(box);
+    label.appendChild(text);
+    return label;
+  }
+
+  function adminStatus(text, failed) {
+    var node = $('admin-status');
+    setText('admin-error', failed ? text : '');
+    if (!node) return;
+    node.textContent = failed ? '' : text;
+    node.hidden = failed || !text;
+  }
+
+  function loadAdminDocument() {
+    if (!adminEnabled) return Promise.resolve(null);
+    return apiRequest(API_ADMIN_USERS, {
+      method: 'GET',
+      headers: { 'Accept': 'application/json', 'X-Qwen-UI': '1' }
+    }, 'json').then(function (r) {
+      if (r.network) {
+        adminStatus('The server is unreachable, so the accounts could not be ' +
+                    'read.', true);
+        return null;
+      }
+      var code = (r.res && typeof r.res.status === 'number') ? r.res.status : 0;
+      if (r.bodyError || code !== 200) {
+        adminStatus('The account list could not be read (HTTP ' + code + ').',
+                    true);
+        return null;
+      }
+      var doc = parseAdminDocument(r.json);
+      // The parser's sentinel is an OBJECT, so a truthiness test would render
+      // half a table from it: the identity check is the contract.
+      if (doc === INVALID) {
+        adminStatus('The account list did not match the expected schema, so ' +
+                    'nothing here is shown.', true);
+        return null;
+      }
+      adminDoc = doc;
+      renderAdminTable(adminDoc);
+      adminStatus('', false);
+      return doc;
+    });
+  }
+
+  // One write path for every admin POST: the SAME CSRF header, the same
+  // closed response check, and the whole refreshed document back — the table
+  // shows what the store holds, never what the page guessed.
+  function postAdmin(url, envelope, doneText) {
+    if (adminBusy) return Promise.resolve(null);
+    adminBusy = true;
+    adminStatus('Saving…', false);
+    renderAdminTable(adminDoc);
+    return apiRequest(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Qwen-UI': '1',
+                 'Accept': 'application/json' },
+      body: JSON.stringify(envelope)
+    }, 'json').then(function (r) {
+      if (r.network) {
+        adminStatus('The server is unreachable, so nothing was saved.', true);
+        return null;
+      }
+      var code = (r.res && typeof r.res.status === 'number') ? r.res.status : 0;
+      if (!r.bodyError && r.json && r.json.schema === ERROR_SCHEMA) {
+        adminStatus(adminRefusal(r.json, code), true);
+        return null;
+      }
+      if (r.bodyError || code !== 200) {
+        adminStatus('The change was not saved (HTTP ' + code + ').', true);
+        return null;
+      }
+      var doc = parseAdminDocument(r.json);
+      if (doc === INVALID) {
+        adminStatus('The server answered with an unexpected document, so the ' +
+                    'table may be out of date. Reload the page.', true);
+        return null;
+      }
+      adminDoc = doc;
+      renderAdminTable(adminDoc);
+      adminStatus(doneText, false);
+      return doc;
+    }).then(function (doc) {
+      adminBusy = false;
+      renderAdminTable(adminDoc);
+      return doc;
+    });
+  }
+
+  // Server refusals on the admin page are the server's own bounded text: the
+  // code and one line, never a raw document.
+  function adminRefusal(payload, code) {
+    var message = 'The server refused the change (HTTP ' + code + ').';
+    if (typeof payload.code === 'string' && /^[a-z0-9_]{1,64}$/.test(payload.code)) {
+      message = payload.code + ': ' +
+        (typeof payload.message === 'string'
+          ? payload.message.slice(0, 200) : 'no message');
+    }
+    return message;
+  }
+
+  function commitAdminPermissions(row, key, box) {
+    var allow = {};
+    for (var p = 0; p < PERMISSION_KEYS.length; p++) {
+      allow[PERMISSION_KEYS[p]] = row.allow[PERMISSION_KEYS[p]] === true;
+    }
+    allow[key] = box.checked === true;
+    postAdmin(API_ADMIN_PERMISSIONS, {
+      schema: ADMIN_PERMISSIONS_REQUEST_SCHEMA, email: row.email, allow: allow
+    }, PERMISSION_LABELS[key] + (allow[key] ? ' enabled' : ' disabled') +
+       ' for ' + row.email + '.');
+  }
+
+  function commitAdminDisplayName(email, input) {
+    var value = pyStrip(input.value);
+    postAdmin(API_ADMIN_DISPLAY_NAME, {
+      schema: ADMIN_DISPLAY_NAME_REQUEST_SCHEMA, email: email,
+      display_name: value
+    }, value ? 'Display name saved for ' + email + '.'
+             : 'Display name cleared for ' + email + '.');
+  }
+
+  function submitAdminAdd() {
+    var email = pyStrip($('admin-add-email').value).toLowerCase();
+    var name = pyStrip($('admin-add-name').value);
+    if (!email || email.indexOf('@') === -1) {
+      adminStatus('Type the email address of the person to invite.', true);
+      return null;
+    }
+    var envelope = { schema: ADMIN_ADD_REQUEST_SCHEMA, email: email };
+    if (name) envelope.display_name = name;
+    return postAdmin(API_ADMIN_ADD, envelope,
+                     'Invited ' + email + '. A new account starts with Q8 only.')
+      .then(function (doc) {
+        if (!doc) return null;
+        $('admin-add-email').value = '';
+        $('admin-add-name').value = '';
+        updateAdminAddButton();
+        return doc;
+      });
+  }
+
+  function updateAdminAddButton() {
+    var button = $('admin-add-submit');
+    if (!button) return;
+    button.disabled = adminBusy || !pyStrip($('admin-add-email').value);
+  }
+
+  // Remove is confirmed IN the page (never alert()/confirm()), and the tick
+  // box is the only thing that authorizes deleting an account's files.
+  function beginAdminRemove(email) {
+    adminRemoveTarget = email;
+    var panel = $('admin-remove-confirm');
+    if (!panel) return;
+    setText('admin-remove-question',
+            'Remove ' + email + '? They lose access to this studio at once.');
+    $('admin-delete-data').checked = false;
+    panel.hidden = false;
+    var question = $('admin-remove-question');
+    if (question) question.focus();
+  }
+
+  function cancelAdminRemove() {
+    adminRemoveTarget = null;
+    hideIf('admin-remove-confirm', true);
+    setText('admin-remove-question', '');
+    $('admin-delete-data').checked = false;
+  }
+
+  function confirmAdminRemove() {
+    var email = adminRemoveTarget;
+    if (!email) return Promise.resolve(null);
+    var deleteData = $('admin-delete-data').checked === true;
+    return postAdmin(API_ADMIN_REMOVE, {
+      schema: ADMIN_REMOVE_REQUEST_SCHEMA, email: email, delete_data: deleteData
+    }, 'Removed ' + email +
+       (deleteData ? ', and deleted their images and references.' : '.')
+    ).then(function (doc) {
+      cancelAdminRemove();
+      return doc;
+    });
+  }
+
   /* ---------------- View routing ----------------
    * Hash-driven views only. An unknown hash (e.g. the skip link's #main)
    * must NOT silently reroute a History/Settings view back to Create — the
@@ -3900,8 +4553,9 @@
     Object.keys(VIEWS).forEach(function (name) {
       $(VIEWS[name]).hidden = name !== active;
     });
-    ['create', 'history', 'settings', 'help'].forEach(function (name) {
+    ['create', 'history', 'settings', 'admin', 'help'].forEach(function (name) {
       var link = $('nav-' + name);
+      if (!link) return;   // Help is not a VIEWS key; Admin may be absent
       if (name === active) link.setAttribute('aria-current', 'page');
       else link.removeAttribute('aria-current');
     });
@@ -3915,6 +4569,10 @@
       // and a download may have finished since this page last looked.
       loadModelStatus();
     }
+    // The account list is server state too: another browser may have invited
+    // someone since this page last looked, and a stale table would show a
+    // permission the store no longer holds.
+    if (active === 'admin') loadAdminDocument();
   }
 
   function routeOnHashchange() {
@@ -3932,6 +4590,19 @@
     if (!Object.prototype.hasOwnProperty.call(VIEWS, name)) {
       return;   // unknown non-empty hash (#main, #whatever): keep current view
     }
+    // The Admin view exists in the markup on every page but is only
+    // reachable where the status document said this listener serves it: a
+    // remote page typing #admin gets the same view it would get by typing
+    // any other unknown hash.
+    if (name === 'admin' && !adminEnabled) {
+      renderView('create');
+      return;
+    }
+    // A remote account has no Settings: the server chooses its rewriter.
+    if (name === 'settings' && currentUser) {
+      renderView('create');
+      return;
+    }
     if (name === activeView) return;
     renderView(name);
     var heading = $(VIEW_HEADINGS[name]);
@@ -3942,7 +4613,10 @@
     var name = (location.hash || '').replace(/^#/, '');
     // Own-property check only: inherited names like #constructor or
     // #toString must NOT select a view (unknown hash falls back to Create).
-    if (!Object.prototype.hasOwnProperty.call(VIEWS, name)) {
+    // Admin is decided by the status document, which on a cold load has not
+    // arrived yet; it therefore never wins the initial route.
+    if (!Object.prototype.hasOwnProperty.call(VIEWS, name) ||
+        name === 'admin') {
       name = 'create';
     }
     renderView(name);   // no focus on load
@@ -4043,6 +4717,14 @@
             : (typeof job.image_bytes === 'number' && isFinite(job.image_bytes) &&
                Number.isInteger(job.image_bytes) && job.image_bytes >= 0 &&
                job.image_url !== null))) return null;
+    // C3 queue position, OPTIONAL and additive: 0 means "generating now", a
+    // positive number is how many jobs are ahead, null means "not waiting".
+    // An older server omits it entirely, and the page then says nothing at
+    // all rather than inventing a position.
+    if (job.queue_position !== undefined && !(
+          job.queue_position === null ||
+          (Number.isInteger(job.queue_position) && job.queue_position >= 0 &&
+           job.queue_position <= 1000000))) return null;
     // Older servers have no step observations; keep their bar indeterminate.
     if (job.progress !== undefined && (!job.progress ||
         !Number.isInteger(job.progress.completed_steps) ||
@@ -4066,12 +4748,33 @@
     return 'qi21-' + job.config.seed + '.' + fmt;
   }
 
+  // The ONE job this page has in flight, if any: a remote account may hold
+  // exactly one queued-or-running job, so the job list and the button speak
+  // from the same fact.
+  function ownActiveJob() {
+    var ids = Object.keys(jobCache);
+    for (var i = 0; i < ids.length; i++) {
+      if (!jobTerminal(jobCache[ids[i]])) return jobCache[ids[i]];
+    }
+    return null;
+  }
+
   function updateGenerate() {
-    $('generate-btn').disabled = !apiConnected || !generationConnected || submittingJob;
+    // A remote account with a job already in flight is refused by the server
+    // with queue_limit; the button says so BEFORE it is pressed. The owner's
+    // page keeps its "Queue another image" (the server queues those).
+    var own = ownActiveJob();
+    var queued = !!currentUser && !!own;
+    $('generate-btn').disabled = !apiConnected || !generationConnected ||
+      submittingJob || queued;
     var active = Object.keys(jobCache).some(function (id) { return !jobTerminal(jobCache[id]); });
-    $('generate-btn').textContent = submittingJob ? 'Submitting…' : active ? 'Queue another image' : 'Generate';
+    $('generate-btn').textContent = submittingJob ? 'Submitting…'
+      : queued ? 'One job at a time'
+      : active ? 'Queue another image' : 'Generate';
     setText('generate-reason', generationConnected
-      ? (submittingJob ? 'Submitting…' : 'Jobs run one at a time. Model and resource checks run for each job.')
+      ? (submittingJob ? 'Submitting…'
+        : queued ? TYPED_ERROR_SENTENCES.queue_limit
+        : 'Jobs run one at a time. Model and resource checks run for each job.')
       : (modelsMissingBlocked ? MODELS_GENERATE_REASON
                                 : GENERATION_UNAVAILABLE_REASON));
   }
@@ -4099,6 +4802,16 @@
     };
     var feedback = descriptions[job.state];
     if (job.elapsed_ms !== null) feedback += ' Elapsed: ' + (job.elapsed_ms / 1000).toFixed(0) + ' s.';
+    // The queue position is the SERVER's ordinal, shown only where the server
+    // sent one: "0" is the job now generating, and a finished job has none.
+    var queueText = '';
+    if (Number.isInteger(job.queue_position)) {
+      queueText = job.queue_position === 0
+        ? 'Your job is generating now.'
+        : 'Your job is #' + job.queue_position + ' in the queue.';
+    }
+    setText('job-queue', queueText);
+    hideIf('job-queue', !queueText);
     setText('job-feedback', feedback);
     $('job-feedback').dataset.state = job.state;
     $('job-progress-panel').hidden = false;
@@ -5161,6 +5874,17 @@
         });
       });
 
+    // The Admin page: one form for adding, one in-page confirmation for
+    // removing. Both write straight away and print the server's answer.
+    $('admin-add-form').addEventListener('submit', function (ev) {
+      ev.preventDefault();
+      submitAdminAdd();
+    });
+    $('admin-add-email').addEventListener('input', updateAdminAddButton);
+    $('admin-remove-yes').addEventListener('click', function () { confirmAdminRemove(); });
+    $('admin-remove-cancel').addEventListener('click', cancelAdminRemove);
+    hideIf('admin-remove-confirm', true);
+
     window.addEventListener('hashchange', routeOnHashchange);
     initTheme();   // persisted theme applied before first paint of content
     initialRoute();
@@ -5306,6 +6030,32 @@
     MODELS_DOWNLOAD_REQUEST_SCHEMA: MODELS_DOWNLOAD_REQUEST_SCHEMA,
     API_MODELS: API_MODELS,
     API_MODELS_DOWNLOAD: API_MODELS_DOWNLOAD,
-    API_MODELS_DOWNLOAD_CANCEL: API_MODELS_DOWNLOAD_CANCEL
+    API_MODELS_DOWNLOAD_CANCEL: API_MODELS_DOWNLOAD_CANCEL,
+    // Remote-user and Admin surface for the checks: the identity block decides
+    // which controls exist, so the checks apply real status documents and then
+    // read the page; the admin table, its parsers and its envelopes are
+    // exercised against the server's own documents without a live server.
+    parseUserBlock: parseUserBlock,
+    applyUserState: applyUserState,
+    showNotInvited: showNotInvited,
+    typedErrorSentence: typedErrorSentence,
+    updateHistoryCapWarning: updateHistoryCapWarning,
+    ownActiveJob: ownActiveJob,
+    parseAdminDocument: parseAdminDocument,
+    renderAdminTable: renderAdminTable,
+    loadAdminDocument: loadAdminDocument,
+    adminFirstSignInText: adminFirstSignInText,
+    submitAdminAdd: submitAdminAdd,
+    beginAdminRemove: beginAdminRemove,
+    confirmAdminRemove: confirmAdminRemove,
+    cancelAdminRemove: cancelAdminRemove,
+    API_ADMIN_USERS: API_ADMIN_USERS,
+    API_ADMIN_ADD: API_ADMIN_ADD,
+    API_ADMIN_REMOVE: API_ADMIN_REMOVE,
+    API_ADMIN_PERMISSIONS: API_ADMIN_PERMISSIONS,
+    API_ADMIN_DISPLAY_NAME: API_ADMIN_DISPLAY_NAME,
+    ADMIN_SCHEMA: ADMIN_SCHEMA,
+    PERMISSION_KEYS: PERMISSION_KEYS,
+    SIGN_OUT_HREF: SIGN_OUT_HREF
   };
 })();

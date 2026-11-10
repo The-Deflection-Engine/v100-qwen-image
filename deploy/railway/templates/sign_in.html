@@ -1,0 +1,156 @@
+{{define "sign_in.html"}}
+<!DOCTYPE html>
+<html lang="en" data-theme="original">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Sign in to Lightseed Studio</title>
+<!-- Self-contained: no CDN, no external fonts, no analytics, no scripts
+     beyond the redirect-hash fixup below. -->
+<style>
+  :root {
+    --bg: #16181b;
+    --bg-panel: #1d2024;
+    --border: #33383f;
+    --text: #e9e7e2;
+    --text-muted: #9ba1a9;
+    --accent: #7C8CFF;
+    --on-accent: #14161a;
+    --error: #e07b7b;
+    --radius: 8px;
+    --font: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue",
+            Arial, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { min-height: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font);
+    font-size: 16px;
+    line-height: 1.55;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+  }
+  main {
+    width: 100%;
+    max-width: 460px;
+    background: var(--bg-panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 32px;
+    text-align: center;
+  }
+  .logo { margin: 0 auto 24px; max-width: 240px; }
+  .logo svg { display: block; width: 100%; height: auto; }
+  h1 {
+    margin: 0 0 8px;
+    font-size: 20px;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+  }
+  .lede { margin: 0 0 24px; color: var(--text-muted); font-size: 15px; }
+  form { margin: 0; }
+  button {
+    width: 100%;
+    padding: 12px 20px;
+    border: 0;
+    border-radius: var(--radius);
+    background: var(--accent);
+    color: var(--on-accent);
+    font-family: inherit;
+    font-size: 15px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  button:hover { filter: brightness(1.08); }
+  button:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+  .message { margin: 0 0 20px; color: var(--text-muted); font-size: 14px; }
+  .alert {
+    margin: 0 0 16px;
+    padding: 10px 12px;
+    border: 1px solid var(--error);
+    border-radius: var(--radius);
+    color: var(--error);
+    font-size: 14px;
+  }
+  .privacy {
+    margin: 24px 0 0;
+    padding-top: 20px;
+    border-top: 1px solid var(--border);
+    text-align: left;
+    font-size: 13px;
+    line-height: 1.5;
+    color: var(--text-muted);
+  }
+  .privacy h2 {
+    margin: 0 0 8px;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  .privacy p { margin: 0 0 8px; }
+  .privacy p:last-child { margin-bottom: 0; }
+  footer {
+    margin-top: 20px;
+    font-size: 12px;
+    color: var(--text-muted);
+    text-align: center;
+  }
+</style>
+</head>
+<body>
+<main>
+  {{ if .LogoData }}
+  <div class="logo">{{.LogoData}}</div>
+  {{ end }}
+  <h1>Sign in to Lightseed Studio</h1>
+  <p class="lede">One Google account, no password to remember.</p>
+
+  {{ if eq .StatusCode 403 }}
+  <div class="alert">This Google account cannot sign in. Ask the owner for an invitation.</div>
+  {{ end }}
+
+  {{ if .SignInMessage }}
+  <p class="message">{{.SignInMessage}}</p>
+  {{ end }}
+
+  <form method="GET" action="{{.ProxyPrefix}}/start">
+    <input type="hidden" name="rd" value="{{.Redirect}}">
+    <button type="submit">Sign in with {{.ProviderName}}</button>
+  </form>
+
+  <section class="privacy">
+    <h2>What signing in stores</h2>
+    <p>Your Google email address and the stable Google account id that comes with it.</p>
+    <p>Your prompts, and up to five images per person, on the owner's PC. Nothing is stored
+      here on the web server.</p>
+    <p>Only your own images are shown to you. The owner can delete your data at any time;
+      ask them if you want it removed.</p>
+  </section>
+</main>
+<footer>Lightseed Studio</footer>
+<script>
+  // Preserve any #fragment on the page the user was sent here from: the form
+  // submits a query string, so the hash has to travel in the rd value.
+  if (window.location.hash) {
+    var inputs = document.getElementsByName('rd');
+    for (var i = 0; i < inputs.length; i++) {
+      var idx = inputs[i].value.indexOf('#');
+      if (idx >= 0) {
+        inputs[i].value = inputs[i].value.substr(0, idx);
+      }
+      inputs[i].value += window.location.hash;
+    }
+  }
+</script>
+</body>
+</html>
+{{end}}

@@ -43,6 +43,7 @@ need its own reviewed bind/auth policy (a later milestone).
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import ipaddress
 import os
@@ -52,9 +53,12 @@ import selectors
 import queue
 import socket
 import stat as stat_module
+import subprocess
 import sys
 import threading
+from dataclasses import dataclass, replace
 from pathlib import Path
+from collections.abc import Mapping
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from importlib import resources
@@ -65,7 +69,9 @@ from qwen_engine import model_setup as _setup
 from qwen_engine import rewrite as rw
 from qwen_engine import rewrite_client as rc
 from qwen_engine.config import ConfigError, GenerationConfig
+from qwen_engine.users import UserStore, UserStoreError, users_path
 from qwen_engine.web import api
+from qwen_engine.web import remote as _remote
 from qwen_engine.web import rewrite_service as _rewrite_service
 from qwen_engine.web.api import ApiError, ApiResponse, WebRuntime
 
@@ -100,6 +106,17 @@ MAX_QUEUED_CONNECTIONS = 16
 #: content type is refused 415 before the body is ever read.
 _JSON_CONTENT_TYPE_RE = re.compile(
     r"application/json(\s*;\s*charset\s*=\s*utf-8)?\Z", re.IGNORECASE)
+
+#: The remote listener's public origin (the Railway domain). Scheme + host +
+#: optional port, NOTHING else: no path, no query, no userinfo, no trailing
+#: slash — an origin is compared for equality, so a nearly-right value would
+#: silently refuse every browser POST.
+_REMOTE_ORIGIN_RE = re.compile(
+    r"https?://[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?(?::[0-9]{1,5})?\Z")
+
+#: A git short sha as ``rev-parse --short`` prints it (7-40 hex characters);
+#: anything else from the subprocess is "unknown", never echoed.
+_SERVER_VERSION_RE = re.compile(r"[0-9a-f]{7,40}\Z")
 
 #: Bundled brand artwork: byte-for-byte copies of the agreed Lightseed assets
 #: under web_static/brand/. Served through the SAME fixed allowlist as the text
@@ -154,6 +171,17 @@ _REFERENCE_ROUTE = re.compile(r"/api/v1/references/([0-9a-f]{64})(/thumb)?\Z")
 MODELS_ROUTE = api.MODELS_HREF
 MODELS_DOWNLOAD_ROUTE = api.MODELS_DOWNLOAD_HREF
 MODELS_CANCEL_ROUTE = api.MODELS_CANCEL_HREF
+
+#: Admin (contract C4). Five routes, no ids and no paths on the wire: an
+#: account is named by email inside a closed JSON envelope, and every write
+#: answers with the whole refreshed user list. They exist on a listener the
+#: operator controls; a listener that serves remote users refuses them with the
+#: ordinary "no such route", so nothing about them is discoverable there.
+ADMIN_USERS_ROUTE = "/api/v1/admin/users"
+ADMIN_ADD_ROUTE = "/api/v1/admin/users/add"
+ADMIN_REMOVE_ROUTE = "/api/v1/admin/users/remove"
+ADMIN_PERMISSIONS_ROUTE = "/api/v1/admin/users/permissions"
+ADMIN_DISPLAY_NAME_ROUTE = "/api/v1/admin/users/display-name"
 
 #: The one route that accepts raw bytes instead of JSON (design §2.4).
 _OCTET_STREAM_CONTENT_TYPE_RE = re.compile(r"application/octet-stream\Z",
@@ -390,6 +418,8 @@ def resolve_route(method: str, target: str) -> tuple[str, str]:
             return "settings_get", target
         if target == MODELS_ROUTE:
             return "models", target
+        if target == ADMIN_USERS_ROUTE:
+            return "admin_users", target
         if target == JOBS_ROUTE:
             return "jobs", target
         match = _REFERENCE_ROUTE.fullmatch(target)
@@ -418,6 +448,14 @@ def resolve_route(method: str, target: str) -> tuple[str, str]:
             return "forget_all", target
         if target == REFERENCES_ROUTE:
             return "upload", REFERENCES_ROUTE
+        if target == ADMIN_ADD_ROUTE:
+            return "admin_add", target
+        if target == ADMIN_REMOVE_ROUTE:
+            return "admin_remove", target
+        if target == ADMIN_PERMISSIONS_ROUTE:
+            return "admin_permissions", target
+        if target == ADMIN_DISPLAY_NAME_ROUTE:
+            return "admin_display_name", target
     ref_match = _REFERENCE_ROUTE.fullmatch(target)
     if ref_match:
         raise ApiError(405, "method_not_allowed", "this route does not accept that method",
@@ -447,6 +485,15 @@ def resolve_route(method: str, target: str) -> tuple[str, str]:
         raise ApiError(405, "method_not_allowed",
                        "a model download is started or stopped with POST",
                        headers=(("Allow", "POST"),))
+    if target == ADMIN_USERS_ROUTE:
+        raise ApiError(405, "method_not_allowed",
+                       "the admin user list is read with GET",
+                       headers=(("Allow", "GET"),))
+    if target in (ADMIN_ADD_ROUTE, ADMIN_REMOVE_ROUTE, ADMIN_PERMISSIONS_ROUTE,
+                  ADMIN_DISPLAY_NAME_ROUTE):
+        raise ApiError(405, "method_not_allowed",
+                       "this admin action is sent with POST",
+                       headers=(("Allow", "POST"),))
     known = set(STATIC_ROUTES) | {STATUS_ROUTE, PLAN_ROUTE, EXPORT_ROUTE,
                                   IMPORT_ROUTE, REWRITE_ROUTE, SETTINGS_ROUTE,
                                   SETTINGS_TEST_ROUTE, MODELS_ROUTE,
@@ -462,6 +509,186 @@ def resolve_route(method: str, target: str) -> tuple[str, str]:
                        "this route does not accept that method",
                        headers=(("Allow", allow),))
     raise ApiError(404, "not_found", "no such route")
+
+
+# ---------------------------------------------------------------------------
+# The remote listener (C1): proxy identity, per-user policy, remote host checks
+# ---------------------------------------------------------------------------
+
+
+@functools.lru_cache(maxsize=1)
+def read_server_version() -> str:
+    """C5: this checkout's git short sha, read ONCE at startup, or "unknown".
+
+    Never a request-time subprocess and never an error: a tarball without
+    ``.git`` (or a machine without git) simply reports "unknown", which is
+    what the Railway offline page shows instead of a version.
+    """
+    try:
+        completed = subprocess.run(
+            ("git", "rev-parse", "--short", "--verify", "HEAD"),
+            cwd=os.path.dirname(os.path.dirname(os.path.dirname(
+                os.path.dirname(os.path.abspath(__file__))))),
+            capture_output=True, timeout=5, check=False,
+            env={"GIT_CONFIG_NOSYSTEM": "1", "PATH": os.environ.get("PATH", "/usr/bin:/bin")},
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+    if completed.returncode != 0:
+        return "unknown"
+    sha = completed.stdout.decode("utf-8", "replace").strip()
+    if _SERVER_VERSION_RE.fullmatch(sha) is None:
+        return "unknown"
+    return sha
+
+
+@dataclass(frozen=True)
+class RemoteSettings:
+    """Everything one remote listener needs, resolved ONCE at startup.
+
+    ``token`` is already read and validated from the 0600 file, ``origin`` is
+    the canonical public origin the browser POSTs from, ``users`` is the
+    allowlist, and ``web_runtime`` carries the reference store the rewrite
+    ownership check reads. Immutable: request handling only reads it.
+    """
+
+    token: bytes
+    origin: str
+    users: "UserStore"
+    web_runtime: WebRuntime
+    generation: Any = None
+    #: Add anyone who gets through Google sign-in (Q8 only) instead of
+    #: refusing them as not invited. ``--remote-auto-invite``.
+    auto_invite: bool = False
+
+
+def remote_origin_error(value: str | None) -> str | None:
+    """Typed startup refusal for ``--remote-origin`` (an ORIGIN, nothing more)."""
+    if value is None or not value:
+        return "--remote-origin is required for the remote port"
+    if not value.isascii() or _REMOTE_ORIGIN_RE.fullmatch(value) is None:
+        return ("--remote-origin must be one http(s) origin such as "
+                "https://studio.example.com: no path, query, credentials or "
+                "trailing slash")
+    return None
+
+
+def remote_settings_error(args: argparse.Namespace) -> str | None:
+    """The all-or-none rule for the four C1 flags, checked before any bind."""
+    def supplied(name: str) -> bool:
+        # `is not None`, NOT truthiness: port 0 is a legal ephemeral bind and
+        # must not be read as "left out" (that would silently drop the
+        # remote listener, or half-configure it).
+        return getattr(args, name, None) is not None
+
+    names = ("remote_port", "remote_host", "remote_token_file", "remote_origin")
+    if not any(supplied(name) for name in names):
+        return None
+    missing = [name for name in names if not supplied(name)]
+    if missing:
+        return ("the remote listener needs ALL of --remote-port, --remote-host, "
+                "--remote-token-file and --remote-origin together (missing "
+                + ", ".join("--" + name.replace("_", "-") for name in missing) + ")")
+    if not 0 <= args.remote_port <= 65535:
+        return "--remote-port must be in [0, 65535]"
+    hosts = list(dict.fromkeys(args.remote_host or []))
+    if len(hosts) > 8 or any(not valid_bind_host(host) for host in hosts):
+        return ("--remote-host: use at most eight explicit IPv4 loopback, RFC1918 "
+                "LAN or Tailscale addresses; wildcards, DNS names and public "
+                "addresses are unsupported")
+    return remote_origin_error(args.remote_origin)
+
+
+def remote_host_allowed(values: list[str]) -> bool:
+    """The remote listener accepts a Host of ANY name at the right port.
+
+    C1: the Railway domain points at the Tailscale node, so the browser's Host
+    is the public domain while the TCP connection is the tunnel — the name
+    cannot be checked against the bound literal. The proxy token is what
+    proves the caller, and this returns True only for exactly one well-formed
+    ``name[:port]`` header (no duplicates, userinfo, whitespace or non-ASCII).
+    """
+    if len(values) != 1:
+        return False
+    host = values[0]
+    if not host or not host.isascii() or "@" in host or any(ch.isspace() for ch in host):
+        return False
+    name, sep, port_part = host.rpartition(":")
+    if sep and not name:
+        return False
+    if sep and (not _port_ok(port_part) or int(port_part) == 0):
+        return False
+    if not sep:
+        # No port is unusual for HTTP/1.1 but harmless: the name is unverified
+        # on this listener anyway, so a bare name changes nothing.
+        return True
+    return bool(name)
+
+
+#: The page documents a remote browser may open by top-level navigation from
+#: another site (C1): the app shell only, never an API route.
+REMOTE_NAVIGATION_TARGETS = frozenset({"/", "/index.html"})
+
+
+def remote_page_navigation(method: str, headers: dict[str, list[str]],
+                           target: str) -> bool:
+    """True for a plain top-level page load of the app shell."""
+    return (method == "GET" and target in REMOTE_NAVIGATION_TARGETS
+            and headers.get("sec-fetch-mode") == ["navigate"]
+            and headers.get("sec-fetch-dest") == ["document"])
+
+
+def remote_request_error(method: str, headers: dict[str, list[str]],
+                         settings: RemoteSettings, *, upload: bool = False,
+                         max_body_bytes: int | None = None) -> ApiError | None:
+    """Post-Host policy for the remote listener: token FIRST, then the rest.
+
+    The proxy token is checked before anything else and its refusal carries no
+    detail, so a caller without the secret learns nothing about this listener.
+    Everything after it is the SAME :func:`header_policy` the local port uses,
+    with one substitution: the expected Origin is the configured PUBLIC origin
+    (the browser talks to Railway, not to the tunnel address), because the
+    remote listener cannot derive one from its own socket. The CSRF header is
+    still required — the proxy alone does not make a cross-site POST impossible.
+    """
+    try:
+        _remote.check_proxy_token(headers, settings.token)
+    except ApiError as exc:
+        return exc
+    return header_policy(method, headers, settings.origin, upload=upload,
+                         max_body_bytes=max_body_bytes)
+
+
+def remote_identity(settings: "RemoteSettings", headers: dict[str, list[str]]
+                    ) -> tuple["_remote.RemoteIdentity", dict[str, bool]]:
+    """(identity, permissions) for this request, refusing anyone not invited.
+
+    The OWNER of a remote user's data is the account's stable ``sub``, never
+    the email: an address can be recycled, an account id cannot — ``.sub`` is
+    what the dispatcher uses as the owner id.
+    """
+    identity = _remote.verify_user(settings.users,
+                                  _remote.parse_identity(headers),
+                                  auto_invite=settings.auto_invite)
+    return identity, _remote.permissions(settings.users, identity)
+
+
+def remote_status_response(settings: "RemoteSettings",
+                           identity: "_remote.RemoteIdentity",
+                           allow: dict[str, bool]) -> ApiResponse:
+    """The remote status document: ``admin: false`` plus this person's block.
+
+    ``identity``/``allow`` are the caller's ALREADY verified pair (the
+    dispatcher resolves them once per request), so this cannot disagree with
+    what the same request's other routes would be allowed to do.
+    """
+    generation = settings.generation
+    finished = 0 if generation is None else generation.controller.finished_for(identity.sub)
+    return api.status_response(
+        settings.web_runtime,
+        server_version=read_server_version(),
+        admin=False,
+        user=_remote.user_block(identity, allow, history_count=finished))
 
 
 # ---------------------------------------------------------------------------
@@ -538,6 +765,63 @@ def load_static_assets() -> dict[str, bytes]:
 
 
 # ---------------------------------------------------------------------------
+# Server identity + the status document's listener-specific additions
+# ---------------------------------------------------------------------------
+
+
+def status_payload(server: Any, handler: Any) -> dict[str, Any]:
+    """The status document for ONE request, with the listener's own additions.
+
+    ``api.status_response`` stays the pure, runtime-only document (its key set
+    is pinned by tests and by the plan gate). What a listener adds is decided
+    here, per request:
+
+    * ``admin`` — true only where the admin routes are actually served, so the
+      tab can never appear on a page whose writes would 404;
+    * ``server_version`` — the startup identity (C5), unless the runtime
+      already carries one;
+    * ``user`` — the remote identity block, supplied by the listener through
+      ``status_user(handler)`` (D2's hook). A local listener has no hook and
+      therefore no block, which is exactly "this page is the owner's".
+
+    Every field is added only when its source exists: a server without an
+    admin service reports no ``admin`` key at all rather than a false one.
+    """
+    payload = dict(api.status_response(server.web_runtime).payload)
+    if "server_version" not in payload:
+        version = getattr(server, "server_version", None)
+        payload["server_version"] = version if isinstance(version, str) \
+            else read_server_version()
+    service = getattr(server, "admin", None)
+    if "admin" not in payload:
+        payload["admin"] = service is not None and _admin_allowed_on(server,
+                                                                    handler)
+    if "user" not in payload:
+        hook = getattr(server, "status_user", None)
+        if callable(hook):
+            block = hook(handler)
+            if isinstance(block, Mapping):
+                payload["user"] = dict(block)
+    return payload
+
+
+def _admin_allowed_on(server: Any, handler: Any) -> bool:
+    """Whether THIS request may use the admin routes.
+
+    Absent means "yes": every pre-existing listener is the owner's own, and a
+    server built by the tests carries no attribute at all. A bool is honoured;
+    a callable is asked (D2's listener context can then decide per request).
+    """
+    flag = getattr(server, "admin_enabled", True)
+    if callable(flag):
+        try:
+            return bool(flag(handler))
+        except Exception:  # pragma: no cover - a hook must never 500 a page
+            return False
+    return bool(flag)
+
+
+# ---------------------------------------------------------------------------
 # Handler
 # ---------------------------------------------------------------------------
 
@@ -552,6 +836,25 @@ class _Handler(BaseHTTPRequestHandler):
     # (the console only ever sees fixed startup/diagnostic lines).
     def log_message(self, fmt: str, *args: Any) -> None:  # pragma: no cover
         pass
+
+    def _admin_service(self) -> Any:
+        """The admin service for THIS request, or the ordinary "no such route".
+
+        Two independent gates, both of which must pass:
+
+        * the listener must carry one at all (``server.admin``), so a
+          planning-only or test server has no admin surface;
+        * this request must be allowed one (``server.admin_enabled``), which
+          D2's remote listener sets to false.
+
+        The refusal is the 404 a route that was never published gives — not a
+        403 — because "there is no admin page here" is the truth a remote user
+        is allowed to learn, and nothing more.
+        """
+        service = getattr(self.server, "admin", None)
+        if service is None or not _admin_allowed_on(self.server, self):
+            raise ApiError(404, "not_found", "no such route")
+        return service
 
     def _header_map(self) -> dict[str, list[str]]:
         out: dict[str, list[str]] = {}
@@ -681,18 +984,13 @@ class _Handler(BaseHTTPRequestHandler):
         # NO Expect extension is supported (including 100-continue): never
         # send an early 100 before Host/Origin/length validation, never read
         # an unsupported Expect body. The 417 itself goes through the same
-        # Host/header policy first.
+        # Host/header policy first — the LISTENER's policy, so an early error
+        # cannot be used to probe a remote listener without its proxy token.
         headers = self._header_map()
-        host_origin, host_err = validate_host(headers.get("host", []),
-                                              self.server.bound_ip,
-                                              self.server.bound_port,
-                                              getattr(self.server, "host_names", frozenset()))
-        if host_err is not None:
-            err = ApiError(400, "invalid_host", host_err)
-        else:
-            err = header_policy(self.command, headers, host_origin) or \
-                ApiError(417, "expectation_failed",
-                         "this server supports no Expect extensions")
+        err = self._request_policy(self.command, headers,
+                                   getattr(self, "raw_target", "")) or \
+            ApiError(417, "expectation_failed",
+                     "this server supports no Expect extensions")
         self._send_api(ApiResponse(status=err.status, payload=err.to_payload(),
                                    headers=err.headers))
         return False
@@ -737,44 +1035,101 @@ class _Handler(BaseHTTPRequestHandler):
             self.request_version = None
             self.command = None
 
+    def _request_policy(self, method: str, headers: dict[str, list[str]],
+                        target: str) -> ApiError | None:
+        """This LISTENER's Host check plus its post-Host header policy.
+
+        The local listener validates Host against its own bound literal; the
+        remote listener (C1) validates only the SHAPE, because the browser's
+        Host is the public Railway domain while the socket is the tunnel. Both
+        then apply the same header policy, differing only in which origin is
+        expected. Sending a request to the wrong listener's rules is therefore
+        impossible: the rules come from the socket that received it.
+        """
+        remote = getattr(self.server, "remote", None)
+        upload = method == "POST" and target == REFERENCES_ROUTE
+        max_body_bytes = (api.MAX_REWRITE_REQUEST_BYTES
+                          if method == "POST" and target == REWRITE_ROUTE
+                          else None)
+        if remote is not None:
+            if not remote_host_allowed(headers.get("host", [])):
+                return ApiError(400, "invalid_host",
+                                "exactly one well-formed Host header is required")
+            if remote_page_navigation(method, headers, target):
+                # People arrive at the public page from other sites: the
+                # redirect back from Google sign-in, or a link in an email.
+                # The browser marks those loads cross-site. Only the static
+                # page itself is let through; every API route keeps the check.
+                headers = {name: values for name, values in headers.items()
+                           if name != "sec-fetch-site"}
+            return remote_request_error(method, headers, remote, upload=upload,
+                                        max_body_bytes=max_body_bytes)
+        host_origin, host_err = validate_host(headers.get("host", []),
+                                              self.server.bound_ip,
+                                              self.server.bound_port,
+                                              getattr(self.server, "host_names", frozenset()))
+        if host_err is not None:
+            return ApiError(400, "invalid_host", host_err)
+        # The upload route's content-type/length rules differ, so the header
+        # policy needs to know the route BEFORE it is applied. The rewrite
+        # route also carries a TIGHTER body cap than the generic JSON limit
+        # (its body is one bounded prompt), chosen from the same constant the
+        # browser enforces locally.
+        return header_policy(method, headers, host_origin, upload=upload,
+                             max_body_bytes=max_body_bytes)
+
     def _dispatch(self, method: str) -> None:
         try:
             self.close_connection = True  # POST/error close; static too (simple)
             headers = self._header_map()
-            host_origin, host_err = validate_host(headers.get("host", []),
-                                                  self.server.bound_ip,
-                                                  self.server.bound_port,
-                                                  getattr(self.server, "host_names", frozenset()))
-            if host_err is not None:
-                err = ApiError(400, "invalid_host", host_err)
-                self._send_api(ApiResponse(status=err.status, payload=err.to_payload()))
-                return
             # Route on the RAW wire target ONLY (never the stdlib-normalized
             # self.path): the stdlib folds '//' in self.path before the app
             # sees it, and TAB request lines reach self.path normalized too.
             # An uncapturable/absent raw target is '' -> resolve_route refuses.
             target = getattr(self, "raw_target", "")
-            # The upload route's content-type/length rules differ, so the
-            # header policy needs to know the route BEFORE it is applied.
-            # The rewrite route also carries a TIGHTER body cap than the
-            # generic JSON limit (its body is one bounded prompt), chosen
-            # from the same constant the browser enforces locally.
-            err = header_policy(
-                method, headers, host_origin,
-                upload=method == "POST" and target == REFERENCES_ROUTE,
-                max_body_bytes=(api.MAX_REWRITE_REQUEST_BYTES
-                                if method == "POST" and target == REWRITE_ROUTE
-                                else None))
-            if err is not None:
-                self._send_api(ApiResponse(status=err.status, payload=err.to_payload(),
-                                           headers=err.headers))
+            policy_err = self._request_policy(method, headers, target)
+            if policy_err is not None:
+                self._send_api(ApiResponse(status=policy_err.status,
+                                           payload=policy_err.to_payload(),
+                                           headers=policy_err.headers))
                 return
             kind, arg = resolve_route(method, target)
+            remote = getattr(self.server, "remote", None)
+            # Every listener sees only its own owner's jobs: on the local port
+            # that is the person at the machine, so invited people's pictures
+            # never appear in the owner's History (the Admin page shows only
+            # counts). ``owner_id`` is what NEW data is tagged with.
+            allow = history_cap = queue_limit = None
+            identity = None
+            owner = owner_id = api.LOCAL_OWNER
+            if remote is not None:
+                # C1: the owner-only routes do not EXIST here — the same 404 an
+                # unknown target gets, so a remote client cannot even probe.
+                if kind in _remote.REMOTE_FORBIDDEN_KINDS or kind.startswith("admin_"):
+                    raise ApiError(404, "not_found", "no such route")
+                if kind != "static":
+                    # Every other route needs a proven, INVITED identity. The
+                    # static shell is served regardless so the page itself can
+                    # say "you're not invited" instead of showing a blank tab.
+                    identity, allow = remote_identity(remote, headers)
+                    owner = owner_id = identity.sub
+                    history_cap = _remote.REMOTE_HISTORY_CAP
+                    queue_limit = _remote.REMOTE_QUEUE_LIMIT
             if kind == "static":
                 asset, ctype = STATIC_ROUTES[arg]
                 self._send(200, self.server.assets[asset], ctype)
             elif kind == "status":
-                self._send_api(api.status_response(self.server.web_runtime))
+                if remote is None:
+                    self._send_api(ApiResponse(200, status_payload(self.server, self)))
+                else:
+                    self._send_api(remote_status_response(remote, identity, allow))
+                return
+            elif kind == "admin_users":
+                # Refused BEFORE any body/route work, and refused with the same
+                # answer a never-published route gives: on a listener that
+                # serves other people, the admin page does not exist.
+                service = self._admin_service()
+                self._send_api(service.list_response())
             elif kind == "settings_get":
                 self._send_api(settings_get_response(
                     getattr(self.server, "rewrite", None)))
@@ -783,19 +1138,31 @@ class _Handler(BaseHTTPRequestHandler):
                     getattr(self.server, "setup", None), self.client_address))
             elif kind in ("reference", "reference_thumb"):
                 data, ctype = api.reference_bytes(self.server.web_runtime, arg,
-                                                  thumb=kind == "reference_thumb")
+                                                  thumb=kind == "reference_thumb",
+                                                  # Uploads made before owner
+                                                  # tagging have no owner record,
+                                                  # so the local port reads the
+                                                  # store unfiltered.
+                                                  owner=None if remote is None else owner)
                 self._send(200, data, ctype)
             elif kind in ("jobs", "job", "image"):
                 jobs = getattr(self.server, "generation", None)
                 if jobs is None:
                     raise ApiError(503, "generation_disabled", "generation is disabled on this server")
                 if kind == "image":
-                    filename = jobs.image_filename(arg)
-                    image_bytes = jobs.image(arg)
+                    # A remote owner's id is looked up under THEIR ownership, so
+                    # another person's job id answers the same fixed 404 as an
+                    # id that never existed.
+                    filename = jobs.image_filename(arg, owner=owner)
+                    image_bytes = jobs.image(arg, owner=owner)
                     self._send(200, image_bytes, jobs.image_content_type(image_bytes),
                                (("Content-Disposition", f'inline; filename="{filename}"'),))
+                elif kind == "jobs":
+                    self._send_api(jobs.list_response(owner=owner,
+                                                      history_cap=history_cap))
                 else:
-                    self._send_api(jobs.list_response() if kind == "jobs" else jobs.job_response(arg))
+                    self._send_api(jobs.job_response(arg, owner=owner,
+                                                     history_cap=history_cap))
             else:
                 if kind == "rewrite":
                     # The service exists on EVERY server (a disabled one holds
@@ -812,7 +1179,30 @@ class _Handler(BaseHTTPRequestHandler):
                         return
                     # Envelope + semantics are validated by the wire contract
                     # BEFORE the service sees the prompt.
-                    self._send_api(service.submit(api.build_rewrite_request(body)))
+                    request = api.build_rewrite_request(body)
+                    backend = None
+                    if remote is not None:
+                        # C3: a remote draft may only be about the person's OWN
+                        # references, may not use the owner's enhancer without
+                        # the permission, and an edit draft needs "edit".
+                        _remote.check_rewrite_permission(request["task"], allow)
+                        _remote.check_reference_ownership(
+                            self.server.web_runtime.references_dir,
+                            request["image_ids"], owner)
+                        backend = _remote.rewrite_backend_for(allow)
+                    self._send_api(service.submit(request, backend=backend))
+                    return
+                if kind.startswith("admin_"):
+                    # The service is resolved (and may refuse with the ordinary
+                    # 404) BEFORE one body byte is read: a listener that does
+                    # not serve the admin page never consumes an admin write.
+                    service = self._admin_service()
+                    length = int(headers["content-length"][0])
+                    body = self.rfile.read(length)
+                    if len(body) != length:
+                        self.send_error(400, "request body ended early")
+                        return
+                    self._send_api(service.post_response(kind, body))
                     return
                 length = int(headers["content-length"][0])
                 body = self.rfile.read(length)
@@ -846,21 +1236,25 @@ class _Handler(BaseHTTPRequestHandler):
                 else:
                     if kind == "upload":
                         self._send_api(api.upload_reference_response(
-                            self.server.web_runtime, body))
+                            self.server.web_runtime, body, owner=owner_id))
                         return
                     jobs = getattr(self.server, "generation", None)
                     if jobs is None:
                         raise ApiError(503, "generation_disabled", "generation is disabled on this server")
                     if kind == "submit":
-                        self._send_api(jobs.submit(body))
+                        self._send_api(jobs.submit(
+                            body, owner=owner_id, allow=allow,
+                            history_cap=history_cap, queue_limit=queue_limit))
                     elif kind == "forget_all":
-                        self._send_api(jobs.forget_all_response(body))
+                        self._send_api(jobs.forget_all_response(body, owner=owner))
                     elif kind == "forget":
-                        self._send_api(jobs.forget_response(arg, body))
+                        self._send_api(jobs.forget_response(
+                            arg, body, owner=owner, history_cap=history_cap))
                     else:
                         if api.parse_request_json(body) != {}:
                             raise ApiError(400, "invalid_envelope", "job actions require an empty JSON object")
-                        self._send_api(jobs.job_response(arg, action=kind))
+                        self._send_api(jobs.job_response(arg, action=kind, owner=owner,
+                                                         history_cap=history_cap))
         except ApiError as exc:
             self._send_api(ApiResponse(status=exc.status, payload=exc.to_payload(),
                                        headers=exc.headers))
@@ -955,6 +1349,26 @@ def stop_workers(conn_queue: "queue.Queue[Any]",
     return still_alive
 
 
+#: Largest TCP segment the remote listener sends. Railway reaches the PC over a
+#: direct Tailscale path, and on that path full-size packets from the PC
+#: (1,228-byte segments in a 1,280-byte tailnet packet) were silently dropped:
+#: small replies arrived, the page itself never did, and the browser hung.
+#: Smaller segments keep every packet under the black hole. Override with
+#: QWEN_REMOTE_TCP_MSS (0 turns the clamp off).
+REMOTE_TCP_MAXSEG = 1100
+
+
+def _remote_tcp_maxseg() -> int | None:
+    raw = os.environ.get("QWEN_REMOTE_TCP_MSS", "").strip()
+    if not raw:
+        return REMOTE_TCP_MAXSEG
+    try:
+        value = int(raw)
+    except ValueError:
+        return REMOTE_TCP_MAXSEG
+    return value if value > 0 else None
+
+
 class _Server(HTTPServer):
     """Explicit-address server with a BOUNDED POOL of persistent worker threads —
     no per-connection thread creation, finite handler idle timeout via
@@ -967,8 +1381,29 @@ class _Server(HTTPServer):
     assets: dict[str, bytes]
     bound_ip: str
     bound_port: int
+    #: Set by ``main``: the checkout's short sha, the owner's admin service
+    #: (absent on a server without a cache dir) and whether THIS listener may
+    #: serve the admin routes.
+    server_version: str
+    admin: Any
+    admin_enabled: bool
 
-    def __init__(self, addr_info, handler) -> None:
+    #: When set, every connection accepted by this listener sends TCP segments
+    #: no larger than this. Set for the remote listener only: see
+    #: REMOTE_TCP_MAXSEG.
+    tcp_max_segment: int | None = None
+
+    def server_bind(self) -> None:
+        # Must happen before listen(): accepted sockets inherit the option.
+        if self.tcp_max_segment and hasattr(socket, "TCP_MAXSEG"):
+            self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_MAXSEG,
+                                   self.tcp_max_segment)
+        super().server_bind()
+
+    def __init__(self, addr_info, handler, *,
+                 tcp_max_segment: int | None = None) -> None:
+        # Read by server_bind, which runs inside the base constructor.
+        self.tcp_max_segment = tcp_max_segment
         self._queue: "queue.Queue[Any]" = queue.Queue(
             maxsize=MAX_QUEUED_CONNECTIONS)
         self._workers: list[threading.Thread] = []
@@ -1209,6 +1644,26 @@ def build_parser() -> argparse.ArgumentParser:
                         "included (default "
                         f"{_rewrite_service.DEFAULT_PE_TIMEOUT_SECONDS:g}: the "
                         "thinking block alone can run to its token budget)")
+    # -- the remote listener (C1): all four or none ------------------------
+    p.add_argument("--remote-port", type=int, default=None,
+                   help="TCP port for the remote listener that Railway's proxy "
+                        "reaches over Tailscale (give all four --remote-* "
+                        "flags or none)")
+    p.add_argument("--remote-host", action="append", default=None,
+                   help="explicit IPv4 address for the remote listener, "
+                        "repeatable (typically the machine's Tailscale address)")
+    p.add_argument("--remote-token-file", default=None, metavar="PATH",
+                   help="0600 file holding the shared proxy token every remote "
+                        "request must present; read once at startup")
+    p.add_argument("--remote-origin", default=None, metavar="ORIGIN",
+                   help="the public origin browsers use, e.g. "
+                        "https://studio.example.com: remote POSTs must carry "
+                        "exactly this Origin")
+    p.add_argument("--remote-auto-invite", action="store_true",
+                   help="give anyone who signs in through the proxy an "
+                        "account (Q8 only) on first visit, so the sign-in "
+                        "provider's own allowlist is the only gate; people "
+                        "removed on the Admin tab stay out")
     for flag in ("output-dir", "cache-dir", "log-dir", "benchmarks-dir",
                  "references-dir"):
         p.add_argument(f"--{flag}", default=None,
@@ -1588,6 +2043,25 @@ def main(argv: list[str] | None = None) -> int:
     setup_service = _setup.ModelSetupService.for_paths(
         models_dir=paths["models_dir"], manifest_path=paths["manifest_path"])
 
+    # The owner's Admin page (C4) needs exactly one durable place for the
+    # allowlist: the cache directory the operator already gave this server.
+    # No cache dir means no admin page at all — a user store that could not be
+    # written would be a page whose writes vanish.
+    # The remote listener reads the SAME store object, so a permission ticked
+    # on the Admin page applies to that person's next request.
+    admin_service = user_store = None
+    users_file = users_path(paths["cache_dir"])
+    if users_file is not None:
+        from qwen_engine.web import admin as _admin
+
+        try:
+            user_store = UserStore(users_file)
+        except UserStoreError as exc:
+            print(f"error: user list: {exc}", file=sys.stderr)
+            return 2
+        admin_service = _admin.AdminService(user_store)
+    server_version = read_server_version()
+
     runtime = WebRuntime(**paths, manifest_summary=summary,
                          generation_enabled=args.enable_generation,
                          rewrite_block=rewrite.status_block(),
@@ -1600,6 +2074,32 @@ def main(argv: list[str] | None = None) -> int:
               "--manifest, --models-dir, --output-dir and --cache-dir",
               file=sys.stderr)
         return 2
+    # -- the remote listener (C1): resolved ONCE, before any bind ----------
+    remote_error = remote_settings_error(args)
+    if remote_error:
+        print(f"error: {remote_error}", file=sys.stderr)
+        return 2
+    remote_settings = None
+    if args.remote_port is not None:
+        if paths["cache_dir"] is None:
+            # The allowlist and the server's own secrets live in the cache
+            # directory; without it nobody could ever be invited.
+            print("error: the remote listener needs --cache-dir for the user list",
+                  file=sys.stderr)
+            return 2
+        try:
+            remote_settings = RemoteSettings(
+                token=_remote.load_proxy_token(args.remote_token_file),
+                origin=args.remote_origin,
+                users=user_store,
+                web_runtime=runtime,
+                auto_invite=bool(args.remote_auto_invite),
+            )
+        except (_remote.RemoteConfigError, UserStoreError) as exc:
+            # Bounded operator diagnostic (a path may be named here; the wire
+            # never carries it) and no listener at all.
+            print(f"error: remote listener: {exc}", file=sys.stderr)
+            return 2
     try:
         assets = load_static_assets()
     except OSError as exc:
@@ -1608,6 +2108,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     listeners = []
+    remote_listeners = []
     port = args.port
     try:
         for host in hosts:
@@ -1619,6 +2120,7 @@ def main(argv: list[str] | None = None) -> int:
             httpd.rewrite = rewrite
             httpd.bound_ip = host
             httpd.bound_port = port
+            httpd.remote = None
             httpd.host_names = host_names
     except OSError as exc:
         for listener in listeners:
@@ -1653,7 +2155,54 @@ def main(argv: list[str] | None = None) -> int:
         listener.generation = httpd.generation
         listener.rewrite = rewrite
         listener.setup = setup_service
-        print(f"qwen-web listening on http://{listener.bound_ip}:{port}")
+        listener.server_version = server_version
+        if admin_service is not None:
+            # One service object, shared by every listener of this process, so
+            # the store has ONE lock. Whether a listener may SERVE the admin
+            # routes is the separate ``admin_enabled`` decision below.
+            admin_service.generation = httpd.generation
+            listener.admin = admin_service
+        # Local listeners are the owner's own, so the Admin tab is offered
+        # there. The remote listeners below set it to False, so the routes
+        # answer 404 there.
+        listener.admin_enabled = True
+        print(f"qwen-web listening on http://{listener.bound_ip}:{listener.bound_port}")
+    if remote_settings is not None:
+        remote_settings = replace(remote_settings, generation=httpd.generation)
+        remote_port = args.remote_port
+        try:
+            max_segment = _remote_tcp_maxseg()
+            for host in dict.fromkeys(args.remote_host):
+                listener = _Server((host, remote_port), _Handler,
+                                   tcp_max_segment=max_segment)
+                remote_listeners.append(listener)
+                remote_port = int(listener.server_address[1])
+                listener.web_runtime = runtime
+                listener.assets = assets
+                # The rewriter SERVICE is shared (one GPU, one slot); the
+                # DECISION of which backend answers a remote draft is not.
+                listener.rewrite = rewrite
+                listener.setup = setup_service
+                listener.generation = httpd.generation
+                listener.bound_ip = host
+                listener.bound_port = remote_port
+                listener.remote = remote_settings
+                listener.server_version = server_version
+                # C1/C4: the admin page never exists on the remote port.
+                listener.admin = None
+                listener.admin_enabled = False
+        except OSError as exc:
+            for listener in listeners + remote_listeners:
+                listener.server_close()
+            print(f"error: cannot bind the remote listener on "
+                  f"{args.remote_host[0]}:{args.remote_port}: "
+                  f"{exc.strerror or exc}", file=sys.stderr)
+            return 1
+        listeners.extend(remote_listeners)
+        for listener in remote_listeners:
+            print(f"qwen-web remote listener on http://{listener.bound_ip}:"
+                  f"{listener.bound_port} (proxy token required; "
+                  f"origin {remote_settings.origin})")
     for name in sorted(host_names):
         print(f"qwen-web also answers as http://{name}:{port}")
     mode = "generation enabled (serial jobs)" if httpd.generation else "planning only (no generation)"

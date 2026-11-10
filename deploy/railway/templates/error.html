@@ -1,0 +1,118 @@
+{{define "error.html"}}
+<!DOCTYPE html>
+<html lang="en" data-theme="original">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>{{.StatusCode}} {{.Title}} — Lightseed Studio</title>
+<style>
+  :root {
+    --bg: #16181b;
+    --bg-panel: #1d2024;
+    --border: #33383f;
+    --text: #e9e7e2;
+    --text-muted: #9ba1a9;
+    --accent: #7C8CFF;
+    --on-accent: #14161a;
+    --radius: 8px;
+    --font: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue",
+            Arial, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { min-height: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font);
+    font-size: 16px;
+    line-height: 1.55;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+  }
+  main {
+    width: 100%;
+    max-width: 520px;
+    background: var(--bg-panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 32px;
+    text-align: center;
+  }
+  .status {
+    font-size: 64px;
+    font-weight: 600;
+    line-height: 1;
+    letter-spacing: -0.03em;
+    color: var(--accent);
+    margin: 0 0 12px;
+  }
+  h1 { margin: 0 0 12px; font-size: 22px; font-weight: 600; }
+  .message { margin: 0; color: var(--text-muted); font-size: 15px; }
+  .actions { margin-top: 24px; display: flex; gap: 12px; }
+  .actions form { flex: 1; margin: 0; }
+  button {
+    width: 100%;
+    padding: 11px 18px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: transparent;
+    color: var(--text);
+    font-family: inherit;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  button.primary {
+    border-color: var(--accent);
+    background: var(--accent);
+    color: var(--on-accent);
+  }
+  button:hover { filter: brightness(1.1); }
+  button:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+  details {
+    margin-top: 24px;
+    padding-top: 16px;
+    border-top: 1px solid var(--border);
+    text-align: left;
+    font-size: 13px;
+    color: var(--text-muted);
+  }
+  summary { cursor: pointer; font-weight: 600; color: var(--text); }
+  details p { margin: 8px 0 0; overflow-wrap: anywhere; }
+  footer { margin-top: 20px; font-size: 12px; color: var(--text-muted); }
+</style>
+</head>
+<body>
+<main>
+  <div class="status">{{.StatusCode}}</div>
+  <h1>{{.Title}}</h1>
+  {{ if .Message }}<p class="message">{{.Message}}</p>{{ end }}
+
+  {{ if .Redirect }}
+  <div class="actions">
+    <form method="GET" action="{{.Redirect}}">
+      <button type="submit">Go back</button>
+    </form>
+    <form method="GET" action="{{.ProxyPrefix}}/sign_in">
+      <input type="hidden" name="rd" value="{{.Redirect}}">
+      <button type="submit" class="primary">Sign in again</button>
+    </form>
+  </div>
+  {{ end }}
+
+  {{ if .RequestID }}
+  <details>
+    <summary>Technical details</summary>
+    <p>Request ID: {{.RequestID}}</p>
+  </details>
+  {{ end }}
+</main>
+<footer>Lightseed Studio</footer>
+</body>
+</html>
+{{end}}

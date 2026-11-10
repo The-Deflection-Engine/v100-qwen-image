@@ -232,3 +232,115 @@ def test_root_must_be_an_existing_directory(tmp_path):
         rs.put_bytes("", encode_image())
     with pytest.raises(rs.ReferenceStoreError, match="existing directory"):
         rs.list_ids(tmp_path / "never-created")
+
+
+# ---------------------------------------------------------------------------
+# Owner index (C3): a shared, content-addressed store with per-owner edges
+# ---------------------------------------------------------------------------
+
+
+def _shared(tmp_path):
+    raw = encode_image()
+    return raw, rs.put_bytes(tmp_path, raw)
+
+
+def test_an_edge_is_idempotent_and_scoped_to_its_owner(tmp_path):
+    _, reference_id = _shared(tmp_path)
+    assert rs.owners_for(tmp_path, reference_id) == ()
+    rs.add_owner(tmp_path, "sub-alice", reference_id)
+    rs.add_owner(tmp_path, "sub-alice", reference_id)   # idempotent
+    assert rs.owners_for(tmp_path, reference_id) == ("sub-alice",)
+    assert rs.owner_ids(tmp_path, "sub-alice") == (reference_id,)
+    assert rs.owner_ids(tmp_path, "sub-bob") == ()
+
+
+def test_an_edge_to_bytes_the_store_does_not_hold_is_refused(tmp_path):
+    with pytest.raises(rs.ReferenceStoreError, match="not stored"):
+        rs.add_owner(tmp_path, "sub-alice", "0" * 64)
+
+
+@pytest.mark.parametrize("owner", ["", "a b", "a\nb", 17, None, "x" * 201])
+def test_an_owner_id_has_one_grammar(tmp_path, owner):
+    _, reference_id = _shared(tmp_path)
+    with pytest.raises(rs.ReferenceStoreError):
+        rs.add_owner(tmp_path, owner, reference_id)
+
+
+def test_owner_ids_skip_an_id_whose_blob_was_removed(tmp_path):
+    _, reference_id = _shared(tmp_path)
+    rs.add_owner(tmp_path, "sub-alice", reference_id)
+    os.unlink(tmp_path / (reference_id + rs.BLOB_SUFFIX))
+    # The edge survives on disk, but an id the store cannot serve is not
+    # offered to the page: the UI would only get a 404 from it.
+    assert rs.owner_ids(tmp_path, "sub-alice") == ()
+
+
+def test_forgetting_one_owner_keeps_a_blob_another_owner_still_holds(tmp_path):
+    _, reference_id = _shared(tmp_path)
+    rs.add_owner(tmp_path, "sub-alice", reference_id)
+    rs.add_owner(tmp_path, "sub-bob", reference_id)
+    released, deleted = rs.forget_owner(tmp_path, "sub-alice")
+    assert released == (reference_id,) and deleted == 0
+    assert rs.owners_for(tmp_path, reference_id) == ("sub-bob",)
+    assert rs.owner_ids(tmp_path, "sub-bob") == (reference_id,)
+    assert rs.read_blob(tmp_path, reference_id) == encode_image()
+    assert (tmp_path / (reference_id + rs.BLOB_SUFFIX)).exists()
+
+
+def test_forgetting_the_last_owner_deletes_blob_sidecar_and_thumbnail(tmp_path):
+    _, reference_id = _shared(tmp_path)
+    rs.add_owner(tmp_path, "sub-alice", reference_id)
+    released, deleted = rs.forget_owner(tmp_path, "sub-alice")
+    assert released == (reference_id,) and deleted == 3
+    for suffix in (rs.BLOB_SUFFIX, rs.SIDECAR_SUFFIX, rs.THUMB_SUFFIX):
+        assert not (tmp_path / (reference_id + suffix)).exists()
+    assert rs.owners_for(tmp_path, reference_id) == ()
+    assert rs.list_ids(tmp_path) == ()
+
+
+def test_forgetting_an_owner_with_no_edges_is_a_no_op(tmp_path):
+    _, reference_id = _shared(tmp_path)
+    rs.add_owner(tmp_path, "sub-bob", reference_id)
+    assert rs.forget_owner(tmp_path, "sub-alice") == ((), 0)
+    assert rs.owners_for(tmp_path, reference_id) == ("sub-bob",)
+
+
+def test_forgetting_treats_a_hand_deleted_blob_as_already_gone(tmp_path):
+    _, reference_id = _shared(tmp_path)
+    rs.add_owner(tmp_path, "sub-alice", reference_id)
+    os.unlink(tmp_path / (reference_id + rs.SIDECAR_SUFFIX))
+    released, deleted = rs.forget_owner(tmp_path, "sub-alice")
+    assert released == (reference_id,) and deleted == 2
+    assert not (tmp_path / (reference_id + rs.BLOB_SUFFIX)).exists()
+
+
+def test_the_owner_index_is_a_closed_document(tmp_path):
+    _, reference_id = _shared(tmp_path)
+    rs.add_owner(tmp_path, "sub-alice", reference_id)
+    path = rs._owners_path(tmp_path)
+    assert path.exists()
+    document = json.loads(path.read_text())
+    assert document["schema"] == rs.OWNERS_SCHEMA
+    assert document["owners"] == {reference_id: ["sub-alice"]}
+
+
+@pytest.mark.parametrize("payload", [
+    b"not json", b"[]", b'{"schema": "wrong", "owners": {}}',
+    b'{"schema": "%s", "owners": []}' % rs.OWNERS_SCHEMA.encode(),
+    b'{"schema": "%s", "owners": {"%s": "sub-a"}}' % (
+        rs.OWNERS_SCHEMA.encode(), b"0" * 64),
+])
+def test_a_corrupt_owner_index_is_a_typed_refusal(tmp_path, payload):
+    _, reference_id = _shared(tmp_path)
+    rs._owners_path(tmp_path).write_bytes(payload)
+    with pytest.raises(rs.ReferenceStoreError):
+        rs.owners_for(tmp_path, reference_id)
+
+
+def test_the_owner_index_refuses_an_id_with_too_many_owners(tmp_path, monkeypatch):
+    _, reference_id = _shared(tmp_path)
+    monkeypatch.setattr(rs, "MAX_OWNERS_PER_ID", 2)
+    rs.add_owner(tmp_path, "sub-a", reference_id)
+    rs.add_owner(tmp_path, "sub-b", reference_id)
+    with pytest.raises(rs.ReferenceStoreError, match="owners"):
+        rs.add_owner(tmp_path, "sub-c", reference_id)

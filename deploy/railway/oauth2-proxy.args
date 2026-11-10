@@ -1,0 +1,40 @@
+# oauth2-proxy arguments, one per line, read by entrypoint.sh with mapfile.
+#
+# Shared verbatim with the smoke test so the flags that ship are the flags that
+# were exercised. Anything that varies per environment (listen address, redirect
+# URL, upstream) comes from OAUTH2_PROXY_* environment variables instead.
+#
+# One argument per line, exactly as written: lines are NOT word-split and NOT
+# glob-expanded. That is why "--scope=openid email" is a single line -- split on
+# white space it would become two arguments and the "email" scope would be
+# dropped, leaving Google to return an ID token with no email claim.
+--provider=google
+--scope=openid email
+--email-domain=*
+--upstream-timeout=330s
+--flush-interval=1s
+# Deliberately no --reverse-proxy: Railway terminates TLS, but without that flag
+# oauth2-proxy refuses to believe client-supplied X-Forwarded-* headers, and
+# --redirect-url plus --cookie-secure already make it emit https. Trusting those
+# headers for a public listener buys nothing and widens what a direct connection
+# could claim.
+--proxy-prefix=/oauth2
+--cookie-name=_lightseed_session
+--cookie-secure=true
+--cookie-httponly=true
+--cookie-samesite=lax
+--cookie-expire=168h
+--ping-path=/oauth2/ping
+--skip-auth-route=^/healthz$
+# Keep oauth2-proxy's own button page off the anonymous path: our branded page
+# is what an unauthenticated visitor must see (it carries the privacy notice).
+# This only affects the 403 sign-in page; /oauth2/start redirects either way.
+--skip-provider-button=false
+--banner=-
+--footer=-
+--custom-templates-dir=/app/templates
+--custom-sign-in-logo=/app/assets/lightseed-logo-on-dark.svg
+--session-store-type=cookie
+--standard-logging
+--request-logging=true
+--auth-logging=true

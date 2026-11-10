@@ -1,0 +1,149 @@
+#!/usr/bin/env node
+// Stand-in for tailscaled, for the local smoke test only.
+//
+// It implements the two things the edge actually uses:
+//   * the local API socket (127.0.0.1 / "$socket") answering
+//     GET /localapi/v0/status with a BackendState;
+//   * the outbound HTTP proxy that carries proxied requests to the tailnet.
+//
+// The proxy relays absolute-form requests to whatever host the request names,
+// exactly as the real userspace proxy does, which is the property the gateway
+// depends on. Nothing here touches a real tailnet, and this file is never
+// copied into the image (see .dockerignore).
+
+const fs = require("node:fs");
+const http = require("node:http");
+const path = require("node:path");
+
+const args = process.argv.slice(2);
+
+function argValue(name) {
+  for (const arg of args) {
+    if (arg === name) {
+      return "";
+    }
+    if (arg.startsWith(name + "=")) {
+      return arg.slice(name.length + 1);
+    }
+  }
+  return null;
+}
+
+const socketPath = argValue("--socket");
+const proxyListen = argValue("--outbound-http-proxy-listen");
+if (!socketPath) {
+  console.error("fake-tailscaled: --socket is required");
+  process.exit(2);
+}
+
+// `tailscale up` writes this marker; until then the node behaves like a fresh
+// install that has not logged in yet.
+const upMarker = socketPath + ".up";
+
+function backendState() {
+  return fs.existsSync(upMarker) ? "Running" : "NeedsLogin";
+}
+
+fs.mkdirSync(path.dirname(socketPath), { recursive: true });
+try {
+  fs.unlinkSync(socketPath);
+} catch {
+  // no stale socket
+}
+
+const api = http.createServer((req, res) => {
+  if (req.headers.host !== "local-tailscaled.sock") {
+    // The real localapi refuses requests that are not addressed to it.
+    res.writeHead(403, { "content-length": "0" });
+    res.end();
+    return;
+  }
+  if (req.method === "GET" && req.url === "/localapi/v0/status") {
+    const body = JSON.stringify({
+      BackendState: backendState(),
+      Self: { TailscaleIPs: [] },
+    });
+    res.writeHead(200, {
+      "content-type": "application/json",
+      "content-length": String(Buffer.byteLength(body)),
+    });
+    res.end(body);
+    return;
+  }
+  res.writeHead(404, { "content-length": "0" });
+  res.end();
+});
+
+api.on("error", (error) => {
+  console.error(`fake-tailscaled: localapi failed: ${error.message}`);
+  process.exit(1);
+});
+api.listen(socketPath, () => {
+  console.error(`fake-tailscaled: localapi on ${socketPath}`);
+});
+
+if (proxyListen) {
+  const [host, portText] = proxyListen.includes("]")
+    ? [proxyListen.slice(0, proxyListen.indexOf("]") + 1), proxyListen.slice(proxyListen.lastIndexOf(":") + 1)]
+    : [proxyListen.slice(0, proxyListen.lastIndexOf(":")), proxyListen.slice(proxyListen.lastIndexOf(":") + 1)];
+
+  // Absolute-form only: a plain HTTP proxy sees "GET http://host/path".
+  const proxy = http.createServer((req, res) => {
+    let target;
+    try {
+      target = new URL(req.url);
+    } catch {
+      res.writeHead(400, { "content-length": "0" });
+      res.end();
+      return;
+    }
+    let forwarded;
+    try {
+      forwarded = http.request({
+        host: target.hostname,
+        port: target.port || 80,
+        path: target.pathname + target.search,
+        method: req.method,
+        headers: { ...req.headers, host: target.host },
+      }, (upstream) => {
+        res.writeHead(upstream.statusCode, upstream.headers);
+        upstream.pipe(res);
+      });
+    } catch {
+      res.writeHead(502, { "content-length": "0" });
+      res.end();
+      return;
+    }
+    forwarded.on("error", () => {
+      // What the real proxy does when the peer is unreachable or logged out.
+      if (!res.headersSent) {
+        res.writeHead(502, { "content-length": "0" });
+      }
+      res.end();
+    });
+    req.pipe(forwarded);
+  });
+
+  // CONNECT is what a SOCKS-less client would use for TLS; this edge never
+  // needs it, and refusing keeps the fake honest about its scope.
+  proxy.on("connect", (_req, socket) => {
+    socket.end("HTTP/1.1 405 Method Not Allowed\r\n\r\n");
+  });
+
+  proxy.on("error", (error) => {
+    // Loud and fatal: a silent proxy would look like a working tailnet.
+    console.error(`fake-tailscaled: outbound proxy failed: ${error.message}`);
+    process.exit(1);
+  });
+
+  proxy.listen(Number(portText), host.replace(/^\[|\]$/g, ""), () => {
+    console.error(`fake-tailscaled: outbound proxy on ${proxyListen}`);
+  });
+}
+
+function shutdown() {
+  api.close();
+  process.exit(0);
+}
+process.on("SIGTERM", shutdown);
+process.on("SIGINT", shutdown);

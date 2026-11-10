@@ -1,11 +1,31 @@
-# Every element id in src/qwen_engine/web_static/index.html at branch `main` (97e561e),
-# taken with: git show main:src/qwen_engine/web_static/index.html
+# Every element id in src/qwen_engine/web_static/index.html at branch `railway`,
+# taken with: git show railway:src/qwen_engine/web_static/index.html
 # The redesign may MOVE and re-style these elements but must never drop or
 # rename one: the script and the test suite find elements by id.
 action-again
 action-download
 action-open
 add-reference
+admin-add-email
+admin-add-form
+admin-add-heading
+admin-add-help
+admin-add-name
+admin-add-submit
+admin-cap
+admin-delete-data
+admin-delete-data-help
+admin-empty
+admin-error
+admin-heading
+admin-name-help
+admin-remove-cancel
+admin-remove-confirm
+admin-remove-question
+admin-remove-yes
+admin-status
+admin-table
+admin-users-body
 advanced
 api-message
 attention
@@ -22,6 +42,7 @@ create-form
 create-heading
 dims-error
 edit-mode
+edit-mode-field
 edit-mode-help
 effective-prompt
 effective-prompt-field
@@ -30,6 +51,7 @@ generate-btn
 generate-reason
 height
 help-heading
+history-cap-warning
 history-confirm
 history-confirm-cancel
 history-confirm-files
@@ -41,11 +63,14 @@ history-grid
 history-heading
 history-missing-note
 history-status
+identity
+identity-name
 import-file
 job-feedback
 job-progress
 job-progress-label
 job-progress-panel
+job-queue
 job-status
 job-timings
 main
@@ -79,24 +104,6 @@ model-row-pe-t2i
 model-row-q8
 model-row-rewrite-prompts
 model-row-turbo
-model-size-base
-model-size-pe-edit
-model-size-pe-t2i
-model-size-q8
-model-size-rewrite-prompts
-model-size-turbo
-model-state-base
-model-state-pe-edit
-model-state-pe-t2i
-model-state-q8
-model-state-rewrite-prompts
-model-state-turbo
-model-tag-base
-model-tick-pe-edit
-model-tick-pe-t2i
-model-tick-q8
-model-tick-rewrite-prompts
-model-tick-turbo
 models-banner
 models-banner-dismiss
 models-banner-heading
@@ -104,9 +111,16 @@ models-banner-link
 models-banner-text
 models-cancel
 models-card
+models-controls
 models-download
 models-error
 models-intro
+model-size-base
+model-size-pe-edit
+model-size-pe-t2i
+model-size-q8
+model-size-rewrite-prompts
+model-size-turbo
 models-list
 models-note
 models-progress
@@ -118,12 +132,29 @@ models-server-only
 models-server-text
 models-settings-heading
 models-status
+model-state-base
+model-state-pe-edit
+model-state-pe-t2i
+model-state-q8
+model-state-rewrite-prompts
+model-state-turbo
 models-total
+model-tag-base
+model-tick-pe-edit
+model-tick-pe-t2i
+model-tick-q8
+model-tick-rewrite-prompts
+model-tick-turbo
+nav-admin
 nav-create
 nav-help
 nav-history
 nav-settings
 negative
+not-invited
+not-invited-email
+not-invited-heading
+not-invited-sign-out
 offload
 offload-help
 output-format
@@ -145,6 +176,7 @@ plan-tokens
 plan-transparency
 presets-1k
 presets-2k
+presets-2k-group
 preview-empty
 preview-frame
 preview-image
@@ -157,6 +189,7 @@ prompt-help
 quant
 quant-error
 quant-help
+quant-q8
 random-seed
 recipe-base
 recipe-error
@@ -183,6 +216,7 @@ rewrite-edit-local-label
 rewrite-edit-local-reason
 rewrite-edit-pe
 rewrite-edit-pe-label
+rewrite-edit-pe-option
 rewrite-edit-pe-reason
 rewrite-endpoint
 rewrite-endpoint-help
@@ -202,6 +236,7 @@ rewrite-proposal
 rewrite-proposal-heading
 rewrite-ratio
 rewrite-save
+rewrite-save-actions
 rewrite-save-status
 rewrite-settings-error
 rewrite-settings-heading
@@ -214,8 +249,10 @@ rewrite-t2i-local-label
 rewrite-t2i-local-reason
 rewrite-t2i-pe
 rewrite-t2i-pe-label
+rewrite-t2i-pe-option
 rewrite-t2i-pe-reason
 rewrite-test
+rewrite-test-actions
 rewrite-test-status
 rewrite-timeout
 rewrite-timeout-help
@@ -226,6 +263,7 @@ settings-backend
 settings-gates
 settings-generation
 settings-heading
+sign-out
 stat-backend
 stat-elapsed
 stat-result
@@ -239,6 +277,7 @@ transparency-note
 transparent
 use-last-image
 vae-tiling
+view-admin
 view-create
 view-help
 view-history

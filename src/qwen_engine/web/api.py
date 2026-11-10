@@ -40,6 +40,7 @@ from qwen_engine import rewrite as _rewrite
 from qwen_engine import rewrite_client as _rewrite_client
 from qwen_engine.config import REF_MAX, SEED_MAX, ConfigError, GenerationConfig
 from qwen_engine.core import plan as core_plan
+from qwen_engine.owners import LOCAL_OWNER
 
 #: Wire schema tags (versioned like every other qwen_engine document).
 WEB_STATUS_SCHEMA = "qwen_engine.web_status.v1"
@@ -915,7 +916,21 @@ class ApiResponse:
     headers: tuple[tuple[str, str], ...] = ()
 
 
-def status_response(runtime: WebRuntime) -> ApiResponse:
+def status_response(runtime: WebRuntime, *, server_version: str | None = None,
+                    admin: bool | None = None,
+                    user: Mapping[str, Any] | None = None) -> ApiResponse:
+    """The status document. Additive and closed: no schema bump.
+
+    Every addition is OPTIONAL and listener-supplied, so this stays the pure
+    runtime document: ``admin`` is True only where the owner-only routes exist
+    (the local port); ``server_version`` is the checkout's git short sha read
+    once at startup (C5, ``"unknown"`` when there is none); ``user`` is the
+    remote listener's identity block
+    (:func:`qwen_engine.web.remote.user_block`), already built by the transport
+    that proved the identity. A caller that passes none of them gets exactly
+    the key set this document had before, which is what keeps the schema tag
+    un-bumped and every existing status test meaningful.
+    """
     summary = dict(runtime.manifest_summary)
     payload = {
         "schema": WEB_STATUS_SCHEMA,
@@ -928,6 +943,17 @@ def status_response(runtime: WebRuntime) -> ApiResponse:
         # nothing here participates in the generation gate.
         "rewrite": rewrite_status_block(runtime),
     }
+    # Each addition is present only when the LISTENER supplies it, so this
+    # function stays the pure runtime document: a caller that owns the value
+    # (the local listener's ``admin: true``, the remote listener's identity
+    # block, the startup read of C5's version) decides, and one that passes
+    # nothing gets exactly the key set this document had before.
+    if server_version is not None:
+        payload["server_version"] = server_version
+    if admin is not None:
+        payload["admin"] = admin
+    if user is not None:
+        payload["user"] = user
     return ApiResponse(status=200, payload=payload)
 
 
@@ -1006,7 +1032,8 @@ def import_response(runtime: WebRuntime, raw_body: bytes) -> ApiResponse:
         return ApiResponse(exc.status, exc.to_payload())
 
 
-def upload_reference_response(runtime: WebRuntime, raw: bytes) -> ApiResponse:
+def upload_reference_response(runtime: WebRuntime, raw: bytes, *,
+                              owner: str = LOCAL_OWNER) -> ApiResponse:
     """Store one raw uploaded reference image (design §2.4).
 
     Validation is the store's (magic sniff, Pillow decode, size/dimension
@@ -1014,6 +1041,11 @@ def upload_reference_response(runtime: WebRuntime, raw: bytes) -> ApiResponse:
     non-images, 409 when the store is at its cap, 503 when the server has no
     usable store — never a path, never a library message. Idempotent: the
     same bytes return the same id.
+
+    ``owner`` (C3) records WHICH account may reference these bytes. The store
+    stays content-addressed and shared, so two accounts uploading identical
+    bytes share one blob; the edge is what makes each of them able to use it
+    and nobody else.
     """
     if runtime.references_dir is None:
         raise ApiError(503, "reference_store_unconfigured",
@@ -1032,6 +1064,7 @@ def upload_reference_response(runtime: WebRuntime, raw: bytes) -> ApiResponse:
     try:
         reference_id = _reference_store.put_bytes(runtime.references_dir, raw)
         sidecar = _reference_store.read_sidecar(runtime.references_dir, reference_id)
+        _reference_store.add_owner(runtime.references_dir, owner, reference_id)
     except _reference_store.ReferenceStoreError as exc:
         text = str(exc)
         if text.startswith(("cannot publish", "reference root is not")):
@@ -1051,12 +1084,24 @@ def upload_reference_response(runtime: WebRuntime, raw: bytes) -> ApiResponse:
 
 
 def reference_bytes(runtime: WebRuntime, reference_id: str, *,
-                    thumb: bool = False) -> tuple[bytes, str]:
+                    thumb: bool = False,
+                    owner: str | None = None) -> tuple[bytes, str]:
     """Hash-verified stored bytes (original or PNG thumbnail) + sniffed
     Content-Type. Unknown/malformed ids and unreadable blobs are ONE 404 —
-    the client learns nothing beyond absence."""
+    the client learns nothing beyond absence.
+
+    ``owner`` (C3) narrows the answer to ids THAT account uploaded: somebody
+    else's id is refused with the same fixed 404 an unknown id gets, so an id
+    cannot be confirmed by guessing it. ``None`` is the owner-side path.
+    """
     if runtime.references_dir is None:
         raise ApiError(404, "reference_unknown", "no such reference")
+    if owner is not None:
+        try:
+            if owner not in _reference_store.owners_for(runtime.references_dir, reference_id):
+                raise ApiError(404, "reference_unknown", "no such reference")
+        except _reference_store.ReferenceStoreError:
+            raise ApiError(404, "reference_unknown", "no such reference") from None
     try:
         data = (_reference_store.read_thumb(runtime.references_dir, reference_id)
                 if thumb else

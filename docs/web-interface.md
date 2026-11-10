@@ -27,13 +27,15 @@ queue/automatic-download/cloud features are out of scope by directive.
 ## Files and boundary
 
 * `src/qwen_engine/web_static/index.html|app.css|app.js` — original,
-  self-contained (no framework, no CDN, no external fonts/analytics). Under
-  W2 the page makes exactly three kinds of request, all **same-origin and
-  relative**: `/api/v1/status` (on load), `/api/v1/plan` and
-  `/api/v1/config/export` (on explicit user actions). No other network code
-  exists. Opening the files over `file://` still works: the single status
-  fetch fails and the chip honestly says **"Not connected"** — static
-  hosting remains disconnected from any engine.
+  self-contained (no framework, no CDN, no external fonts/analytics). Every
+  request the page makes is **same-origin and relative** and goes to one of
+  the literal `/api/v1/…` constants at the top of `app.js` — status on load,
+  then plan/export/import, jobs, references, rewrite, the rewriter settings,
+  the model catalogue/download, and (local listener only) the admin routes.
+  Nothing else: no host, no absolute URL, no CDN, no third party. Opening the
+  files over `file://` still works: the single status fetch fails and the
+  chip honestly says **"Not connected"** — static hosting remains
+  disconnected from any engine.
 * `src/qwen_engine/web/{api.py,server.py,__main__.py}` — W2 server
   (implemented, review-pending): `api.py` is the **contract module** with no
   socket code and no ML — but NOT filesystem-free: `status` serves
@@ -349,6 +351,151 @@ file) produces the generic `server_runtime_configuration` error — never a
 message embedding the private path. Manifest unreadability reasons are a
 closed code set (`manifest_unreadable` etc.); arbitrary caller strings never
 reach the wire.
+
+## Railway multiuser: remote page and local Admin (contracts C3/C4)
+
+Two listeners, one static page. The **local** listener (loopback, LAN,
+Tailscale) is the owner's machine: no `user` block, no sign-out, every
+control, and the Admin tab. A **remote** listener (the Railway container,
+behind an OAuth proxy) adds a `user` block to `/api/v1/status`; the page then
+follows that block and nothing else. Absence of the block is what keeps the
+owner's page byte-for-byte what it was.
+
+### The status additions (all optional, all closed)
+
+| key | when | the page's rule |
+|---|---|---|
+| `admin` | always, from the listener | `true` **only** where the admin routes are actually served; a widened/partial block, or a non-boolean, rejects the whole status |
+| `server_version` | always (C5) | a short startup sha, or `unknown`; shown on the offline/error pages |
+| `user` | remote listeners with an identity hook | exactly `{email, display_name, allow, history}` |
+
+`user.allow` carries the same four flags the store holds (`q8`, `2k`, `edit`,
+`official_enhancer`); `user.history` carries `{count, cap}` and optionally
+`will_replace_oldest`. A block that is widened, partial, or mistyped is
+**refused whole** — half an identity would hide the wrong controls — and the
+page falls back to "not connected" rather than guessing. `parseStatus`
+accepts each addition only when its own closed validator passes, so an older
+server that never heard of multiuser keeps working unchanged.
+
+### What the remote page hides — courtesy, not enforcement
+
+Hiding is a **courtesy**: the server refuses a disallowed feature with
+`feature_not_allowed`, and the page prints that sentence. Nothing is hidden
+for correctness.
+
+* 2K presets, the Edit-with-references box and the Q8 option follow their
+  flags; hiding a *selected* Q8 moves the draft to `fp16` (a hidden option
+  would otherwise still show its text in the closed select), keeping
+  references but not using them.
+* The official-enhancer choices disappear without `official_enhancer`; a
+  remote user's rewriter is otherwise the endpoint.
+* `Settings` writes and the model download controls belong to the owner's
+  machine and are hidden entirely (their routes would 404).
+* The Admin tab is hidden unless `admin: true`.
+
+### The remote page shows
+
+* **Who is signed in** — display name or address — plus one **Sign out** link
+  to `/oauth2/sign_out` (the proxy's own route; the page never invents one).
+* **The history cap**, before Generate, from the server's own numbers:
+  "You have N saved images. Generating another will permanently delete your
+  oldest one." It stays visible (no modal) and quotes `cap` rather than
+  re-deriving 5.
+* **The queue position**: `queue_position` 0 is "Your job is generating now.",
+  N > 0 is "Your job is #N in the queue."; an absent value says nothing.
+* **One job at a time**: with a job queued or running the Generate button is
+  disabled and says "One job at a time", with `queue_limit`'s sentence as the
+  reason.
+* **Typed refusals as plain sentences**: `not_invited` replaces the whole
+  studio ("This account isn't invited — ask the owner", with the proxy-claimed
+  address and the same sign-out link); `feature_not_allowed`, `queue_limit`
+  and `rewrite_unavailable` each have one fixed sentence. Codes outside that
+  closed list keep the bounded generic message — server text is never echoed.
+
+### Admin routes (local listener only)
+
+`GET /api/v1/admin/users`, and `POST` to `/users/add`, `/users/remove`,
+`/users/permissions`, `/users/display-name`. Every write is one closed
+envelope with the shared CSRF header and content-type rules, answers with the
+**whole refreshed document**, and typed errors carry no paths.
+
+| route | envelope | note |
+|---|---|---|
+| `GET /users` | — | `qwen_engine.web_admin.v1`: `{schema, cap, users[]}` |
+| `POST /users/add` | `..._add.v1`: `{schema, email, display_name?}` | no `allow` key: a new account always starts with q8 only |
+| `POST /users/remove` | `..._remove.v1`: `{schema, email, delete_data}` | `delete_data` must be a boolean |
+| `POST /users/permissions` | `..._permissions.v1`: `{schema, email, allow}` | `allow` is closed over the four flags; a partial block is refused |
+| `POST /users/display-name` | `..._display_name.v1`: `{schema, email, display_name}` | trimmed, bounded |
+
+One row per invited account: `email`, `display_name`, `invited`,
+`first_sign_in`, `signed_in`, `history` (finished jobs), `active` (queued or
+running), `allow`. Usage is counted from the job store on each request —
+never cached, so the table cannot drift from History. `first_sign_in` is
+`null` when the store holds no stamp (it records an invite time, not a
+sign-in time): the page shows the store's own date when there is one and
+otherwise "Yes"/"Not yet" from `signed_in`, so it never invents a date.
+
+**Removal order is deliberate.** Data goes first — a store entry removed
+before the jobs would leave files with no way to name their owner. The
+controller is asked to forget that owner's **finished** jobs (with their
+files); a running job is never killed from the admin page. The reference
+store is asked through a capability hook (`forget_owner`) because owner-aware
+upload cleanup arrives with the server-core work; without the hook its files
+stay. Only a ticked "Also delete their images and references" reaches the
+delete path, and unticked the account's files stay on disk but leave its
+history.
+
+**Why the refusal is a 404.** The remote listener answers the admin routes
+with the ordinary `404 not_found`, not a 403: "there is no admin page here"
+is the truth a remote user may learn, and it is exactly what a route that was
+never published says — nothing about the owner's machine is revealed. Two
+independent gates must both pass: the listener carries an admin service at all
+(`server.admin`), and *this request* may use it (`server.admin_enabled`, a
+bool or a per-request callable; a hook that raises fails **closed**).
+
+### Page behaviour on the admin tab
+
+Every write is disabled while one is in flight; the table is rebuilt only
+from a document that passes the same closed validator the server applies, so
+a refusal leaves the previous table intact and names the code
+(`user_exists: …`). Local typos (an address without an `@`) never reach the
+wire. Remove is confirmed **in the page** — never `alert()`/`confirm()` —
+with the delete-files tick box unticked by default, focus moved to the
+question, and the tick reset after each removal.
+
+### Verification (this worktree, 2026-10-27)
+
+Guarded CPU suite, runner-owned temp root, no sockets and no ML:
+`3937 passed, 4 skipped`. New: `tests/test_web_admin.py` (37 tests —
+envelope builders, the closed document validator, `AdminService` write paths,
+the status additions and the admin flag gates, the admin routes through an
+in-memory `_Handler`, a no-paths assertion, plus a Node harness executed
+under `node --check` semantics against the real `app.js` functions: table
+cells and ARIA, 16 malformed documents refused plus `null`/`[]`, the
+first-sign-in column,
+status/refusal sentences, and each write's wire body and refreshed table) and
+`tests/test_web_multiuser_ui.py` (12 tests — the static contract plus an
+executed `applyUserState` matrix over local/remote/denied-flag/cap/queue
+states and the closed `parseUserBlock`). Mutation-checked: reverting the
+`parseAdminDocument` `INVALID` identity test (the sentinel is an object, so a
+truthiness test renders half a table) fails 12 of those tests.
+
+**Real Chrome, real server** (`python -m qwen_engine.web --host 127.0.0.1
+--port 8774 --cache-dir <temp>`, i.e. the local owner's listener; throwaway
+CDP scripts, not product assets): the Admin tab is offered only after the
+status document arrives; clicking it makes `#admin` current, shows the view,
+focuses the heading and draws the empty table with the cap line ("0 of 5
+accounts invited"). Inviting `  Carol@Example.com ` through the form wrote the
+lowered address, an empty name field, "Not yet", zero counts and Q8-only
+ticks; ticking 2K rebuilt the table from the server's answer and said "2K
+sizes enabled for carol@example.com."; Remove opened the in-page panel with
+its question focused and the delete-files tick unticked, and with the tick
+set the row went, the panel closed and the tick reset. A typo'd address was
+refused in the page with no request. Zero console errors. Reload while the
+address ends in `#admin` also lands on the tab. Two behaviours are deliberate
+and documented in code: on a **cold** load `#admin` falls back to Create (the
+admin flag has not arrived yet, so the tab cannot win the initial route), and
+on a remote listener `#admin` is refused exactly like any unknown hash.
 
 ## Verification evidence
 

@@ -1166,16 +1166,27 @@ class RewriteService:
             self._rebuild_clients(previous)
             raise
 
-    def submit(self, request: Mapping[str, Any]) -> ApiResponse:
-        """Run one rewrite to completion (or refuse). Never queues."""
+    def submit(self, request: Mapping[str, Any], *, backend: str | None = None
+               ) -> ApiResponse:
+        """Run one rewrite to completion (or refuse). Never queues.
+
+        ``backend`` forces ONE rewriter for this request, ignoring the saved
+        Settings choice. The remote listener uses it for C3: everyone without
+        ``official_enhancer`` is served by the OpenAI-compatible endpoint, no
+        matter what the owner's Settings say — a remote request must never
+        take the V100 from the person at the machine. ``None`` (the default,
+        and everything on the local port) keeps the saved choice exactly as
+        before.
+        """
         fields = self._validate(request)
-        job = self._claim(fields["task"])
+        job = self._claim(fields["task"], backend=backend)
         thread = threading.Thread(target=self._run, args=(job, fields),
                                   name="rewrite", daemon=True)
         thread.start()
         return self._await(job, fields)
 
-    def _pick_client(self, task: str) -> tuple[Any, str]:
+    def _pick_client(self, task: str, *, backend: str | None = None
+                     ) -> tuple[Any, str]:
         """The client for `task` — the one that TASK's choice resolved to.
 
         No cross-task guessing: `edit` never silently lands on the text
@@ -1188,13 +1199,26 @@ class RewriteService:
         with self._cond:
             active, clients = dict(self._active), dict(self._clients)
             off = self._preferences.off
-            configured = any((task, backend) in clients for backend in BACKENDS)
+            configured = any((task, candidate) in clients for candidate in BACKENDS)
         if off:
             raise ApiError(503, "rewrite_disabled",
                            "rewriting is switched off in Settings")
-        backend = active.get(task)
-        if backend:
-            return clients[(task, backend)], backend
+        if backend is not None:
+            # A forced backend is a permission, not a preference: either this
+            # server can run it or the request is refused. It never falls back
+            # to the enhancer, because that is what forcing exists to prevent.
+            if (task, backend) in clients:
+                return clients[(task, backend)], backend
+            # 503, never 422: the draft kind is supported here, the ONE
+            # rewriter this account is allowed to use is not. A remote user
+            # cannot change Settings, so "configure a rewriter" is the host's
+            # problem, not a client-side task error.
+            raise ApiError(503, "rewrite_unavailable",
+                           "the rewriter this account may use is not "
+                           "configured on this server")
+        chosen = active.get(task)
+        if chosen:
+            return clients[(task, chosen)], chosen
         if configured:
             raise ApiError(503, "rewrite_unavailable",
                            "the rewriter for this draft kind is not ready right now")
@@ -1204,9 +1228,9 @@ class RewriteService:
             "official enhancer needs its checkpoint for this draft kind, and no "
             "OpenAI-compatible endpoint is configured — change it in Settings")
 
-    def _claim(self, task: str) -> _Job:
+    def _claim(self, task: str, *, backend: str | None = None) -> _Job:
         """Take the single slot or refuse. The job owns its own cancel flag."""
-        client, backend = self._pick_client(task)
+        client, backend = self._pick_client(task, backend=backend)
         timeout = float(getattr(client, "timeout", self.settings.timeout))
         with self._cond:
             if self._closing:

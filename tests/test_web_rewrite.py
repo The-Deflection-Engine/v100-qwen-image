@@ -337,6 +337,8 @@ def test_success_response_carries_the_defensive_header_set():
 def test_status_block_is_additive_and_does_not_bump_the_schema():
     payload = api.status_response(api.WebRuntime()).payload
     assert payload["schema"] == api.WEB_STATUS_SCHEMA
+    # C5's version and C4's admin flag come from the listener, not from this
+    # pure runtime document (see ``server.read_server_version``).
     assert set(payload) == {"schema", "planning_available",
                             "generation_available", "gates", "manifest",
                             "generation_blockers", "rewrite"}

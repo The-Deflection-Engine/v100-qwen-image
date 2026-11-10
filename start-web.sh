@@ -39,6 +39,39 @@ qwen_args+=(
   --q8-manifest models/q8_manifest.json
   --output-dir output/web --cache-dir cache
 )
+# The remote listener (C1): remote invited users only, reached by Railway's
+# reverse proxy over Tailscale. Enabled only when a 0600 token file exists (or
+# QWEN_REMOTE_TOKEN_FILE names one) AND the public origin is known; all four
+# flags go together or not at all. Everything stays on the local port: admin,
+# Settings, model downloads and cross-user "delete all history" answer 404
+# here. QWEN_REMOTE_HOST overrides the Tailscale address reported by
+# `tailscale ip -4`; set QWEN_REMOTE=0 to leave the listener out anyway.
+remote_token_file="${QWEN_REMOTE_TOKEN_FILE:-cache/remote-token}"
+remote_origin="${QWEN_REMOTE_ORIGIN:-}"
+remote_tailscale_ip="${QWEN_REMOTE_HOST:-}"
+if [[ ${QWEN_REMOTE:-1} == 1 && -n $remote_origin && -f $remote_token_file ]]; then
+  if [[ -z $remote_tailscale_ip ]] && command -v tailscale >/dev/null 2>&1; then
+    # `|| true`: a tailscaled that is down must leave the listener off, not
+    # abort the launcher under `set -e`.
+    remote_tailscale_ip="$(tailscale ip -4 2>/dev/null | head -n 1 || true)"
+  fi
+  if [[ -n $remote_tailscale_ip ]]; then
+    qwen_args+=(
+      --remote-port "${QWEN_REMOTE_PORT:-8766}"
+      --remote-host "$remote_tailscale_ip"
+      --remote-token-file "$remote_token_file"
+      --remote-origin "$remote_origin"
+    )
+    # QWEN_REMOTE_AUTO_INVITE=1: anyone who gets through Google sign-in gets
+    # an account (Q8 only) on first visit; Google's Test users list is then
+    # the only allowlist. People removed on the Admin tab stay out.
+    if [[ ${QWEN_REMOTE_AUTO_INVITE:-0} == 1 ]]; then
+      qwen_args+=(--remote-auto-invite)
+    fi
+  else
+    echo "notice: no Tailscale IPv4 address found; the remote listener is off" >&2
+  fi
+fi
 # This launcher targets the direct host environment used for CLI validation.
 # Set to 0 when running under a cgroup RAM cap; normal encoder scope checks apply.
 if [[ ${QWEN_ATTEST_UNBOUNDED_HOST:-1} == 1 ]]; then
