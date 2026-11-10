@@ -20,6 +20,16 @@ from qwen_engine.memory import DeviceIdentity, ResourceEvidence
 
 GiB = 1024**3
 
+#: Total memory a reviewed Tesla V100 reports, as inclusive byte ranges: the
+#: 16GB cards report just under 16 GiB, the 32GB cards (SXM2, PCIe, V100S) just
+#: under 32 GiB. Anything else is not a card this engine was reviewed for.
+V100_MEMORY_RANGES = ((15 * GiB, 16 * GiB), (31 * GiB, 32 * GiB))
+
+
+def is_v100_memory(total: object) -> bool:
+    """True when ``total`` bytes is the memory size of a reviewed V100."""
+    return type(total) is int and any(low <= total <= high for low, high in V100_MEMORY_RANGES)
+
 
 class HardwareProbeError(HardwareAbsentError):
     """Fixed diagnostic; unavailable/incoherent measurements never grant fit."""
@@ -88,7 +98,7 @@ def _nvml_snapshot(uuid):
             raise HardwareProbeError("invalid_driver_version")
         memory = _Memory()
         call("nvmlDeviceGetMemoryInfo", handle, ctypes.byref(memory))
-        if (not 15 * GiB <= memory.total <= 16 * GiB or memory.free > memory.total
+        if (not is_v100_memory(int(memory.total)) or memory.free > memory.total
                 or memory.used > memory.total or memory.free + memory.used != memory.total):
             raise HardwareProbeError("incoherent_or_unreviewed_gpu_memory")
         return version, int(memory.total), int(memory.free), int(memory.used)
@@ -140,7 +150,7 @@ class HardwareObservation:
                 or _uuid(self.resources.device.uuid) != self.resources.device.uuid
                 or type(self.gpu_used_bytes) is not int or self.gpu_used_bytes < 0
                 or self.resources.gpu_total_bytes is None or self.resources.gpu_available_bytes is None
-                or not 15 * GiB <= self.resources.gpu_total_bytes <= 16 * GiB
+                or not is_v100_memory(self.resources.gpu_total_bytes)
                 or self.gpu_used_bytes + self.resources.gpu_available_bytes != self.resources.gpu_total_bytes):
             raise HardwareProbeError("invalid_hardware_observation")
 
@@ -170,8 +180,8 @@ def probe_v100(*, logical_device_index: int = 0) -> HardwareObservation:
                 or (properties.major, properties.minor) != (7, 0)
                 or type(properties.name) is not str or not 1 <= len(properties.name) <= 128
                 or "V100" not in properties.name
-                or type(properties.total_memory) is not int or not 15 * GiB <= properties.total_memory <= 16 * GiB):
-            raise HardwareProbeError("required_v100_16gb_profile_unavailable")
+                or not is_v100_memory(properties.total_memory)):
+            raise HardwareProbeError("required_v100_profile_unavailable")
         uuid = _uuid(str(properties.uuid))
         if "sm_70" not in torch.cuda.get_arch_list():
             raise HardwareProbeError("runtime_sm70_kernel_build_unavailable")

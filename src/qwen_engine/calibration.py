@@ -40,7 +40,7 @@ from qwen_engine.bench import (
     add_observation,
 )
 from qwen_engine.errors import EngineError
-from qwen_engine.hardware_probe import _Memory, _uuid
+from qwen_engine.hardware_probe import _Memory, _uuid, is_v100_memory
 from qwen_engine.local_bundle import reference_bundle_fingerprints
 from qwen_engine.manifest import load_manifest
 from qwen_engine.memory import (
@@ -446,16 +446,15 @@ CUDA_BUILD = "12.6"
 
 
 def _require_reviewed_device(properties: Any) -> None:
-    """Refuse every device except the reviewed V100 16GB / sm_70 profile."""
+    """Refuse every device except a reviewed V100 (16GB or 32GB, sm_70)."""
     major = getattr(properties, "major", None)
     minor = getattr(properties, "minor", None)
     total = getattr(properties, "total_memory", None)
     if ((major, minor) != (7, 0)
             or "V100" not in str(getattr(properties, "name", ""))
-            or type(total) is not int
-            or not 15 * GiB <= total <= 16 * GiB):
+            or not is_v100_memory(total)):
         raise CalibrationError(
-            "measurement requires the reviewed Tesla V100 16GB profile")
+            "measurement requires a reviewed Tesla V100 (16GB or 32GB)")
 
 
 class CalibrationCollector:

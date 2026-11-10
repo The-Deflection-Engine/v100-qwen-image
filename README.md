@@ -1,8 +1,8 @@
 # v100-qwen-image
 
 A hand-rolled [Qwen-Image-2.1](https://huggingface.co/Qwen/Qwen-Image-2.1)
-text-to-image engine built to run on a single **Tesla V100 16GB** (Volta,
-sm_70). It provides a headless CLI and a local web workspace, sharing one
+text-to-image engine built to run on a single **Tesla V100** (Volta, sm_70),
+16GB or 32GB. It provides a headless CLI and a local web workspace, sharing one
 engine. Image quality comes first; speed is improved where it does not cost
 quality.
 
@@ -69,7 +69,9 @@ and [`PLAN.md`](PLAN.md).
 ## Requirements
 
 - Linux x86_64, Python 3.11 or 3.13, [uv](https://docs.astral.sh/uv/).
-- NVIDIA Tesla V100 16GB, driver supporting CUDA 12.6.
+- NVIDIA Tesla V100, 16GB or 32GB, driver supporting CUDA 12.6. All
+  measurements were made on the 16GB card; the 32GB card is accepted but has
+  not yet been run (see [Running on another machine](#running-on-another-machine)).
 - About 33 GB of disk for the base model (+ the Q8 GGUF if wanted), and enough
   host RAM for the ~17.5 GB text encoder, which runs on CPU in a child process.
 
@@ -119,8 +121,10 @@ offered in that same list, or place it under `models/q8/` yourself.
 ```
 
 Serves on port 8765 with a single shared job queue. It binds `127.0.0.1` plus
-a LAN and a Tailscale address; override these with `QWEN_LAN_HOST`,
-`QWEN_TAILSCALE_HOST` and `QWEN_WEB_PORT`. Set `QWEN_ATTEST_UNBOUNDED_HOST=0`
+this machine's LAN and Tailscale IPv4 addresses when it has them; override
+these with `QWEN_LAN_HOST`, `QWEN_TAILSCALE_HOST` and `QWEN_WEB_PORT`. It also answers to this PC's
+hostname, `<hostname>.local` and its Tailscale MagicDNS name, listed in
+`cache/web-settings.json` (written on first run; edit it to change them). Set `QWEN_ATTEST_UNBOUNDED_HOST=0`
 when running under a cgroup memory limit. See
 [`docs/lan-tailscale.md`](docs/lan-tailscale.md).
 
@@ -175,6 +179,112 @@ Your prompt text is never modified — a fixed instruction is added only to the
 text the model reads (`GenerationConfig.effective_prompt`). The result is
 model-dependent, not a guaranteed cutout. See
 [`docs/transparency.md`](docs/transparency.md).
+
+## Running on another machine
+
+A checklist for setting the app up on a fresh Linux machine with a V100. It is
+written so that you, or an AI assistant you point at this section, can follow
+it step by step. Every setting is an environment variable read by
+`start-web.sh`; nothing in the repository needs editing.
+
+### 1. Check the machine
+
+| Need | How to check | Notes |
+|---|---|---|
+| Linux x86_64 | `uname -m` → `x86_64` | |
+| Tesla V100, 16GB or 32GB | `nvidia-smi --query-gpu=name,memory.total --format=csv` | sm_70. Other GPUs are refused. |
+| Driver for CUDA 12.6 | `nvidia-smi` shows "CUDA Version: 12.6" or higher | Tested on driver 580.178.04. |
+| Host RAM ≥ 32 GB | `free -g` | The ~17.5 GB text encoder runs on the CPU in a child process. |
+| Disk ≥ 45 GB free | `df -h .` | ~33 GB base model, ~9 GB optional Q8 transformer, ~19 GB optional enhancers. |
+| `git`, `curl`, [uv](https://docs.astral.sh/uv/) | `uv --version` | uv installs Python 3.13 itself. |
+
+### 2. Install
+
+```bash
+git clone https://github.com/EuanWebster/v100-qwen-image.git
+cd v100-qwen-image
+uv venv --python 3.13 .venv
+uv pip sync --python .venv/bin/python --index-strategy unsafe-best-match requirements.lock
+```
+
+Confirm the card is recognised (prints the name, total memory and whether a
+CUDA kernel ran):
+
+```bash
+PYTHONPATH=src .venv/bin/python -c "from qwen_engine.hardware_probe import probe_v100 as p; r=p(); print(r.device_name, r.resources.gpu_total_bytes, r.resources.cuda_kernel_verified)"
+```
+
+### 3. Optional: the official prompt enhancers (llama.cpp)
+
+The Rewrite button can use Qwen's official prompt enhancers, which run under
+your own `llama-server` for the length of one rewrite. Skip this section and
+everything else still works.
+
+- Build: upstream llama.cpp with CUDA for sm_70, for example
+  `cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=70 && cmake --build build -j --target llama-server`.
+  Tested at llama.cpp commit `74b104c` (2026-10-26) built with CUDA 12.4. The
+  edit enhancer needs multimodal (`mtmd`) support, which the standard
+  `llama-server` build includes.
+- Point the launcher at it: `export QWEN_PE_LLAMA_SERVER=/path/to/llama-server`.
+  If unset, the launcher uses `llama-server` from `PATH`.
+- The enhancer models and their system prompts are downloaded from the app's
+  Settings → Models page (step 5); nothing else to fetch by hand.
+
+The other rewriter is any OpenAI-compatible chat endpoint (for example another
+llama-server or vLLM). It is offered whenever the system prompts are installed,
+at `http://127.0.0.1:8079/v1/chat/completions` unless you set
+`QWEN_REWRITE_ENDPOINT`; set `QWEN_REWRITE=0` if you have none.
+
+### 4. Start
+
+```bash
+./start-web.sh
+```
+
+The console lists every address it listens on, then `generation enabled`.
+Open `http://127.0.0.1:8765/` on the machine itself (model downloads are only
+offered there).
+
+| Variable | Default | Effect |
+|---|---|---|
+| `QWEN_WEB_PORT` | `8765` | Port. |
+| `QWEN_LAN_HOST` | the default route's private IPv4, if any | Extra listen address; `""` for none. |
+| `QWEN_TAILSCALE_HOST` | `tailscale ip -4`, if any | Extra listen address; `""` for none. |
+| `QWEN_PE_LLAMA_SERVER` | `llama-server` on `PATH` | Path to llama.cpp's server, for the official enhancers. |
+| `QWEN_PE` | `1` | `0` leaves the official enhancers out. |
+| `QWEN_REWRITE_ENDPOINT` | `http://127.0.0.1:8079/v1/chat/completions` | OpenAI-compatible chat endpoint for rewrites. |
+| `QWEN_REWRITE_MODEL` | `Qwen3.8` | Model name sent to that endpoint. |
+| `QWEN_REWRITE` | `1` | `0` leaves the endpoint rewriter out. |
+| `QWEN_ATTEST_UNBOUNDED_HOST` | `1` | Set `0` inside a container or cgroup with a RAM limit. |
+| `QWEN_ENCODER_THREADS` | auto | CPU threads for the text encoder (1–64). |
+
+Browsers on other machines can use this PC's hostname instead of its IP: the
+first start writes `cache/web-settings.json` with the hostname, its `.local`
+name and its Tailscale name.
+
+### 5. Get the models and run a test
+
+1. Open **Settings → Models**. Download the required base model (~33 GB).
+   Optionally tick the Q8 transformer and the official enhancers.
+2. Back on **Create**, generate a 1K image with the default settings
+   (Quality, FP16). The first job loads the models (about a minute).
+3. Then try a 2K preset (the 1K/2K tabs above the aspect tiles).
+
+### Testing on a 32GB card
+
+Nothing has been run on a 32GB V100 yet, so these results are the useful
+ones to report:
+
+- the output of the probe command in step 2;
+- whether a 1K and a 2K job (FP16) succeed, and the timings shown under the
+  image;
+- 2K at FP16 with a long prompt (over 1,600 characters). On 16GB this runs out
+  of memory above ~500 prompt tokens, so the page shows a warning; on 32GB it
+  should fit, and the warning can be ignored;
+- anything in the `./start-web.sh` console that looks like an error.
+
+The CPU test suite (no GPU needed) also runs on any machine:
+`PYTHON=.venv/bin/python PYTHONPATH=src bash run_cpu_tests.sh`.
 
 ## Tests
 

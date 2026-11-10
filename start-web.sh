@@ -7,11 +7,33 @@ if [[ ! -x .venv/bin/python ]]; then
   echo "Missing project virtual environment: $PROJECT_DIR/.venv/bin/python" >&2
   exit 1
 fi
+# Listen addresses: 127.0.0.1 always, plus this machine's own LAN and
+# Tailscale IPv4 addresses when it has them. The server refuses to start if any
+# address it is given cannot be bound, so only addresses found on THIS machine
+# are passed. QWEN_LAN_HOST / QWEN_TAILSCALE_HOST choose an address explicitly;
+# set either to "" to leave that network out.
+is_private_ipv4() {
+  [[ $1 =~ ^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)[0-9.]+$ ]]
+}
+is_tailscale_ipv4() {
+  [[ $1 =~ ^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.[0-9]+\.[0-9]+$ ]]
+}
+if [[ -z ${QWEN_LAN_HOST+set} ]]; then
+  # The source address of the default route, i.e. the LAN interface.
+  QWEN_LAN_HOST="$(ip -4 route get 1.1.1.1 2>/dev/null | grep -o 'src [0-9.]*' | cut -d' ' -f2 || true)"
+  is_private_ipv4 "$QWEN_LAN_HOST" || QWEN_LAN_HOST=""
+fi
+if [[ -z ${QWEN_TAILSCALE_HOST+set} ]]; then
+  QWEN_TAILSCALE_HOST="$(tailscale ip -4 2>/dev/null | head -n 1 || true)"
+  is_tailscale_ipv4 "$QWEN_TAILSCALE_HOST" || QWEN_TAILSCALE_HOST=""
+fi
 qwen_args=(
   -m qwen_engine.web --enable-generation
   --host 127.0.0.1
-  --host "${QWEN_LAN_HOST:-192.168.68.103}"
-  --host "${QWEN_TAILSCALE_HOST:-100.98.64.62}"
+)
+[[ -n $QWEN_LAN_HOST ]] && qwen_args+=(--host "$QWEN_LAN_HOST")
+[[ -n $QWEN_TAILSCALE_HOST ]] && qwen_args+=(--host "$QWEN_TAILSCALE_HOST")
+qwen_args+=(
   --port "${QWEN_WEB_PORT:-8765}"
   --manifest models/manifest.json --models-dir models/assets
   --q8-manifest models/q8_manifest.json
@@ -93,6 +115,10 @@ fi
 # enhancer reads the same digest-pinned system prompts as the endpoint, so those
 # files are required too. Set QWEN_PE=0 to leave both out even when present.
 pe_binary="${QWEN_PE_LLAMA_SERVER:-$HOME/Sandbox/llama.cpp-build/llama.cpp/build/bin/llama-server}"
+# Unset and not at the default location: use a llama-server on PATH, if any.
+if [[ -z ${QWEN_PE_LLAMA_SERVER:-} && ! -x $pe_binary ]]; then
+  pe_binary="$(command -v llama-server || true)"
+fi
 pe_model="${QWEN_PE_MODEL:-models/pe/PE-T2I-Q8_0/Qwen-Image-2.1-PE-T2I-Q8_0.gguf}"
 pe_i2i_model="${QWEN_PE_I2I_MODEL:-models/pe/PE-I2I-Q8_0/Qwen-Image-2.1-PE-I2I-Q8_0.gguf}"
 pe_i2i_mmproj="${QWEN_PE_I2I_MMPROJ:-models/pe/PE-I2I-Q8_0/mmproj-Qwen-Image-2.1-PE-I2I-BF16.gguf}"
@@ -112,5 +138,25 @@ if [[ ${QWEN_PE:-1} == 1 && -x "$pe_binary" && -r "$pe_model" \
   if [[ -n ${QWEN_PE_TIMEOUT:-} ]]; then
     qwen_args+=(--pe-timeout "$QWEN_PE_TIMEOUT")
   fi
+fi
+# Machine names browsers may type instead of an IP address live in
+# cache/web-settings.json ({"host_names": [...]}), read at startup. The first
+# run writes it with this PC's hostname, its mDNS name (<hostname>.local) and,
+# when Tailscale is up, its MagicDNS name. Edit it and restart to change them;
+# an empty list accepts IP addresses and localhost only.
+if [[ ! -e cache/web-settings.json ]]; then
+  short_name="$(hostname -s 2>/dev/null || true)"
+  magic_dns=""
+  if command -v tailscale >/dev/null 2>&1; then
+    magic_dns="$(tailscale status --self --json 2>/dev/null \
+      | .venv/bin/python -c 'import json,sys; print(json.load(sys.stdin)["Self"]["DNSName"])' 2>/dev/null || true)"
+  fi
+  mkdir -p cache
+  .venv/bin/python - "$short_name" "${magic_dns%.}" > cache/web-settings.json <<'PY'
+import json, sys
+short, magic = (arg.lower() for arg in sys.argv[1:])
+names = [short, short + ".local", magic] if short else [magic]
+print(json.dumps({"host_names": [name for name in names if name]}, indent=2))
+PY
 fi
 exec .venv/bin/python "${qwen_args[@]}" "$@"

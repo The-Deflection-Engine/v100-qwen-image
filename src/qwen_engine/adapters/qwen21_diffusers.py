@@ -52,6 +52,7 @@ from qwen_engine.config import (
 from qwen_engine.encoder import EmbeddingCache
 from qwen_engine.encoder_client import ProductionEncoder
 from qwen_engine.errors import EngineError, HardwareAbsentError
+from qwen_engine.hardware_probe import is_v100_memory
 from qwen_engine.local_bundle import (LocalReferenceBundle, resolve_local_bundle,
                                       TURBO_REFERENCE_PROFILE)
 from qwen_engine.manifest import load_manifest
@@ -296,10 +297,10 @@ def _require_v100(torch) -> Any:
     if (
         (properties.major, properties.minor) != (7, 0)
         or "V100" not in properties.name
-        or not 15 * 1024**3 <= properties.total_memory <= 16 * 1024**3
+        or not is_v100_memory(properties.total_memory)
     ):
         raise HardwareAbsentError(
-            "a Tesla V100 16GB-class device is required; "
+            "a Tesla V100 (16GB or 32GB) is required; "
             f"found {properties.name!r} (compute {properties.major}.{properties.minor})"
         )
     if "sm_70" not in torch.cuda.get_arch_list():

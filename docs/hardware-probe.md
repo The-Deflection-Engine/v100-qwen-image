@@ -3,7 +3,7 @@
 `hardware_probe.probe_v100()` is an explicit fresh-worker diagnostic, not
 startup/server/planning behavior. Its import is ML-free. Pinned package checks
 precede Torch import. It selects a CUDA logical index, requires the reviewed
-CUDA12.6 build, sm_70 compiled kernels and a V10016GB-class device, then runs
+CUDA12.6 build, sm_70 compiled kernels and a Tesla V100 (16GB or 32GB), then runs
 a tiny FP16 matrix multiplication and verifies its synchronized CPU result.
 Enumeration or architecture strings alone cannot establish the kernel check.
 This is not Qwen checkpoint numerics or quality acceptance.

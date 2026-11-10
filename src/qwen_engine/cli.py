@@ -78,7 +78,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="qwen-engine",
         description=(
-            "Qwen-Image-2.1 engine (V100 16GB). Verifies pinned model assets "
+            "Qwen-Image-2.1 engine (V100 16GB/32GB). Verifies pinned model assets "
             "from models/manifest.json; never downloads."
         ),
     )

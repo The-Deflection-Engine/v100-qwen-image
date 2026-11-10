@@ -9,9 +9,10 @@ Safety posture (reviewed W2 contract):
   be used); ``--port 0`` picks an ephemeral port and the actual canonical
   origin is printed after bind.
 * Exactly ONE ``Host`` header, validated against the bound literal + the
-  actual port (plus the ``localhost`` alias for normal browser use — DNS
-  rebinding attempts carry the attacker's own hostname and are refused).
-  No DNS is performed for any of it.
+  actual port (plus the ``localhost`` alias for normal browser use, and any
+  names the operator lists with ``--host-name`` — DNS rebinding attempts
+  carry the attacker's own hostname and are refused). No DNS is performed
+  for any of it.
 * Foreign ``Origin`` or a cross-site/cross-origin ``Sec-Fetch-Site`` value
   is refused on EVERY route — stricter than required, ``same-site`` is also
   denied because another port on loopback is same-site but NOT same-origin
@@ -81,6 +82,12 @@ ALLOWED_BIND_HOSTS = (DEFAULT_HOST,)
 #: usual browser alias for loopback. Everything else (including a rebound
 #: attacker hostname) is refused.
 ALLOWED_HOST_NAMES = ("127.0.0.1", "localhost")
+#: Operator-listed machine names accepted on every listener, from
+#: ``<cache>/web-settings.json`` and/or ``--host-name``.
+MAX_HOST_NAMES = 16
+WEB_SETTINGS_FILENAME = "web-settings.json"
+_WEB_SETTINGS_LIMIT = 16384
+_HOST_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
 _PRIVATE_BIND_NETWORKS = tuple(ipaddress.ip_network(value) for value in
                                ("127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12",
                                 "192.168.0.0/16", "100.64.0.0/10"))
@@ -217,12 +224,62 @@ def valid_bind_host(host: str) -> bool:
     return any(address in network for network in _PRIVATE_BIND_NETWORKS)
 
 
-def validate_host(values: list[str], bound_ip: str,
-                  port: int) -> tuple[str | None, str | None]:
+def valid_host_name(name: str) -> bool:
+    """A lowercase DNS name the operator owns (``pc``, ``pc.local``,
+    ``pc.tailnet.ts.net``). No wildcards, IP literals or ``localhost``: the
+    listener literal and the loopback alias are already accepted, and a name
+    whose last label is numeric could be read as an address."""
+    if not name or len(name) > 253 or not name.isascii() or name != name.lower():
+        return False
+    labels = name.split(".")
+    if not all(_HOST_LABEL.fullmatch(label) for label in labels):
+        return False
+    return not labels[-1].isdigit() and name != "localhost"
+
+
+def read_web_settings(cache_dir: str | None) -> tuple[list[str], str | None]:
+    """(host names, error) from ``<cache_dir>/web-settings.json``, read once at
+    startup. A missing file (or no cache dir) means no names; anything else
+    that is not ``{"host_names": [str, ...]}`` is an error, so a typo stops the
+    server instead of silently locking the names out."""
+    if cache_dir is None:
+        return [], None
+    path = os.path.join(cache_dir, WEB_SETTINGS_FILENAME)
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                     | getattr(os, "O_NONBLOCK", 0))
+    except FileNotFoundError:
+        return [], None
+    except OSError as exc:
+        return [], f"{path} is not readable: {exc.strerror or exc}"
+    try:
+        if not stat_module.S_ISREG(os.fstat(fd).st_mode):
+            return [], f"{path} is not a regular file"
+        raw = os.read(fd, _WEB_SETTINGS_LIMIT + 1)
+    except OSError as exc:
+        return [], f"{path} is not readable: {exc.strerror or exc}"
+    finally:
+        os.close(fd)
+    if len(raw) > _WEB_SETTINGS_LIMIT:
+        return [], f"{path} is larger than {_WEB_SETTINGS_LIMIT} bytes"
+    try:
+        doc = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        return [], f"{path} is not valid JSON: {exc}"
+    names = doc.get("host_names") if isinstance(doc, dict) else None
+    if not isinstance(doc, dict) or set(doc) != {"host_names"} or not isinstance(names, list) \
+            or not all(isinstance(name, str) for name in names):
+        return [], f'{path} must be {{"host_names": ["name", ...]}} and nothing else'
+    return names, None
+
+
+def validate_host(values: list[str], bound_ip: str, port: int,
+                  host_names: frozenset[str] = frozenset()) -> tuple[str | None, str | None]:
     """(expected_origin, error): exactly one Host header naming this listener
-    literal (or localhost on 127.0.0.1) at the actual port; everything else —
-    duplicates, userinfo, whitespace, non-ASCII, missing/foreign port, foreign
-    name — is a typed error string."""
+    literal (or localhost on 127.0.0.1, or an operator-listed ``host_names``
+    entry) at the actual port; everything else — duplicates, userinfo,
+    whitespace, non-ASCII, missing/foreign port, foreign name — is a typed
+    error string."""
     if len(values) != 1:
         return None, f"exactly one Host header is required, got {len(values)}"
     host = values[0]
@@ -244,11 +301,11 @@ def validate_host(values: list[str], bound_ip: str,
         return None, "Host port must not have leading zeros"
     if int(port_part) != port:
         return None, "Host port must match the bound port"
-    names = {bound_ip}
+    names = {bound_ip} | host_names
     if bound_ip == DEFAULT_HOST:
         names.add("localhost")
     if name.lower() not in names:
-        return None, "Host name must match this listener address (or localhost on loopback)"
+        return None, "Host name must match this listener address, localhost on loopback, or a --host-name"
     return f"http://{name.lower()}:{port}", None
 
 
@@ -1009,7 +1066,8 @@ class _Handler(BaseHTTPRequestHandler):
                                         max_body_bytes=max_body_bytes)
         host_origin, host_err = validate_host(headers.get("host", []),
                                               self.server.bound_ip,
-                                              self.server.bound_port)
+                                              self.server.bound_port,
+                                              getattr(self.server, "host_names", frozenset()))
         if host_err is not None:
             return ApiError(400, "invalid_host", host_err)
         # The upload route's content-type/length rules differ, so the header
@@ -1505,6 +1563,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--host", action="append", default=None,
                    help="explicit IPv4 loopback, LAN or Tailscale address; repeat "
                         "to share one job queue across listeners (default: 127.0.0.1)")
+    p.add_argument("--host-name", action="append", default=None, metavar="NAME",
+                   help="a DNS name of this machine (e.g. pc.local or the Tailscale "
+                        "MagicDNS name) that browsers may use in the address bar; "
+                        "accepted on every listener, never resolved; repeatable. "
+                        f"Added to the host_names list in <cache-dir>/{WEB_SETTINGS_FILENAME}")
     p.add_argument("--port", type=int, default=DEFAULT_PORT,
                    help=f"TCP port (default {DEFAULT_PORT}; 0 picks an "
                         "ephemeral port and prints the actual origin)")
@@ -1883,6 +1946,17 @@ def main(argv: list[str] | None = None) -> int:
               "RFC1918 LAN or Tailscale addresses; wildcards, DNS names, public "
               "addresses and IPv6 are unsupported", file=sys.stderr)
         return 2
+    saved_names, settings_err = read_web_settings(args.cache_dir)
+    if settings_err is not None:
+        print(f"error: {settings_err}", file=sys.stderr)
+        return 2
+    host_names = frozenset(name.lower().rstrip(".")
+                           for name in saved_names + (args.host_name or []))
+    if len(host_names) > MAX_HOST_NAMES or any(not valid_host_name(name) for name in host_names):
+        print(f"error: host names ({WEB_SETTINGS_FILENAME} or --host-name) must be at most "
+              f"{MAX_HOST_NAMES} plain DNS names (letters, digits, hyphens and dots; "
+              "no wildcards, IP addresses or localhost)", file=sys.stderr)
+        return 2
     if not 0 <= args.port <= 65535:
         print("error: --port must be in [0, 65535]", file=sys.stderr)
         return 2
@@ -2047,6 +2121,7 @@ def main(argv: list[str] | None = None) -> int:
             httpd.bound_ip = host
             httpd.bound_port = port
             httpd.remote = None
+            httpd.host_names = host_names
     except OSError as exc:
         for listener in listeners:
             listener.server_close()
@@ -2128,6 +2203,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"qwen-web remote listener on http://{listener.bound_ip}:"
                   f"{listener.bound_port} (proxy token required; "
                   f"origin {remote_settings.origin})")
+    for name in sorted(host_names):
+        print(f"qwen-web also answers as http://{name}:{port}")
     mode = "generation enabled (serial jobs)" if httpd.generation else "planning only (no generation)"
     if rewrite.available:
         # Which rewriter answers EACH draft kind, and which ones could have: the

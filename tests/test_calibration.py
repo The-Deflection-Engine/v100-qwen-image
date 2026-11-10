@@ -214,9 +214,21 @@ def test_reviewed_device_gate_compares_values_not_types():
                         total_memory=8 * GiB),
         SimpleNamespace(major=7, minor=0, name=good.name,
                         total_memory=17 * GiB),
+        SimpleNamespace(major=7, minor=0, name=good.name,
+                        total_memory=24 * GiB),
+        SimpleNamespace(major=7, minor=0, name=good.name,
+                        total_memory=33 * GiB),
     ):
         with pytest.raises(cal.CalibrationError, match="reviewed Tesla V100"):
             cal._require_reviewed_device(bad)
+
+
+@pytest.mark.parametrize("name", ["Tesla V100-SXM2-32GB", "Tesla V100-PCIE-32GB",
+                                  "Tesla V100S-PCIE-32GB"])
+def test_the_32gb_v100_cards_are_reviewed_devices(name):
+    # What the driver reports for a 32GB V100: just under 32 GiB.
+    cal._require_reviewed_device(SimpleNamespace(major=7, minor=0, name=name,
+                                                 total_memory=34089730048))
 
 
 def _facts(**overrides):

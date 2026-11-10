@@ -72,7 +72,7 @@ def test_unsupported_device_refuses_before_kernel_or_nvml(probe, case):
     elif case == "name":
         probe.properties.name = "TITAN V"
     elif case == "size":
-        probe.properties.total_memory = 32 * module.GiB
+        probe.properties.total_memory = 24 * module.GiB  # no V100 has 24GB
     elif case == "uuid":
         probe.properties.uuid = "not a UUID"
     else:
@@ -235,3 +235,26 @@ def test_kernel_requires_actual_device_dtype_shape_synchronized_value(case):
             module._kernel(torch, 1)
     assert calls[:4] == ["inference_enter", "ones_cuda_fp16", "matmul", ("synchronize", 1)]
     assert calls[-1] == "inference_exit"
+
+
+@pytest.mark.parametrize("total, accepted", [
+    (16945512448, True),            # V100 16GB as the driver reports it
+    (34089730048, True),            # V100 32GB (SXM2 / PCIe / V100S)
+    (15 * module.GiB, True), (16 * module.GiB, True),
+    (31 * module.GiB, True), (32 * module.GiB, True),
+    (15 * module.GiB - 1, False), (16 * module.GiB + 1, False),
+    (24 * module.GiB, False), (32 * module.GiB + 1, False),
+    (80 * module.GiB, False), (True, False), (16.0 * module.GiB, False), (None, False),
+])
+def test_only_the_16gb_and_32gb_v100_memory_sizes_are_reviewed(total, accepted):
+    assert module.is_v100_memory(total) is accepted
+
+
+def test_a_32gb_v100_passes_the_probe(probe, monkeypatch):
+    probe.properties.name = "Tesla V100-SXM2-32GB"
+    probe.properties.total_memory = 34089730048
+    monkeypatch.setattr(module, "_nvml_snapshot",
+                        lambda uuid: ("560.35.03", 34089730048, 30 * module.GiB,
+                                      34089730048 - 30 * module.GiB))
+    value = module.probe_v100()
+    assert value.resources.gpu_total_bytes == 34089730048

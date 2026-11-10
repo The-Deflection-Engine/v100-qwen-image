@@ -168,8 +168,9 @@ def _run_main(monkeypatch, tmp_path, extra, *, bind_error=None, cache=True):
     opened = []
 
     class Listener:
-        def __init__(self, address, handler):
+        def __init__(self, address, handler, *, tcp_max_segment=None):
             host, port = address
+            self.tcp_max_segment = tcp_max_segment
             if host == bind_error:
                 raise OSError("address unavailable")
             self.server_address = (host, port or 54321 + len(opened))
@@ -306,6 +307,10 @@ def test_the_remote_listener_is_bound_with_token_origin_and_shared_state(
     settings = remote_listener.remote
     assert settings.token == b"x" * 32          # the trailing newline is not secret
     assert settings.origin == "https://studio.example.com"
+    # Railway's userspace Tailscale drops full-size segments: the remote
+    # socket alone is clamped.
+    assert local.tcp_max_segment is None
+    assert remote_listener.tcp_max_segment == server.REMOTE_TCP_MAXSEG
     # ONE worker and ONE rewriter: the remote port is another door, not another
     # GPU user.
     assert remote_listener.web_runtime is local.web_runtime
@@ -370,3 +375,107 @@ def test_a_remote_bind_failure_closes_the_local_listener(tmp_path, monkeypatch):
     assert code == 1
     assert len(opened) == 1 and opened[0].closed
     assert "cannot bind the remote listener" in out
+
+
+NAMES = frozenset({'tiktak-ai', 'tiktak-ai.local', 'tiktak-ai.tail3e3fc8.ts.net'})
+
+
+@pytest.mark.parametrize('host', ['127.0.0.1', '192.168.68.103', '100.98.64.62'])
+@pytest.mark.parametrize('name', sorted(NAMES))
+def test_listed_machine_names_are_accepted_on_every_listener(host, name):
+    assert server.validate_host([name + ':8765'], host, 8765, NAMES) == ('http://' + name + ':8765', None)
+    assert server.validate_host([name.upper() + ':8765'], host, 8765, NAMES) == ('http://' + name + ':8765', None)
+    # The name earns no exemption from the port or Origin checks.
+    assert server.validate_host([name + ':8766'], host, 8765, NAMES)[1]
+    assert server.header_policy('GET', {'origin': ['http://' + host + ':8765']}, 'http://' + name + ':8765').status == 403
+
+
+@pytest.mark.parametrize('name', ['evil.invalid', 'tiktak-ai.evil.invalid', 'evil-tiktak-ai.local', 'tiktak-ai.', ''])
+def test_unlisted_names_are_still_refused(name):
+    assert server.validate_host([name + ':8765'], '192.168.68.103', 8765, NAMES)[1]
+
+
+def test_names_are_refused_when_none_are_listed():
+    assert server.validate_host(['tiktak-ai.local:8765'], '127.0.0.1', 8765)[1]
+
+
+@pytest.mark.parametrize('name', ['pc', 'pc.local', 'tiktak-ai.tail3e3fc8.ts.net', 'a-b.c9', 'x' * 63 + '.local'])
+def test_valid_host_names(name):
+    assert server.valid_host_name(name)
+
+
+@pytest.mark.parametrize('name', ['', 'localhost', '*.local', 'PC.local', '192.168.68.103', '10.0.0.1', 'pc..local',
+                                  '-pc.local', 'pc-.local', 'pc_1.local', 'pc.local:80', 'pc local', 'pç.local',
+                                  'x' * 64 + '.local', '.'.join(['a' * 60] * 5)])
+def test_invalid_host_names(name):
+    assert not server.valid_host_name(name)
+
+
+@pytest.mark.parametrize('bad', [['*.local'], ['localhost'], ['10.0.0.1'], ['pc_1']] + [[f'pc{i}' for i in range(17)]])
+def test_bad_host_name_options_refuse_startup_before_any_bind(monkeypatch, bad, capsys):
+    monkeypatch.setattr(server, '_Server', lambda *a: pytest.fail('bound despite a bad --host-name'))
+    argv = [arg for name in bad for arg in ('--host-name', name)]
+    assert server.main(argv) == 2
+    assert '--host-name' in capsys.readouterr().err
+
+
+class _Started(Exception):
+    pass
+
+
+def _start(monkeypatch, argv):
+    """Run main() up to serving, return the listeners it built (never serves)."""
+    opened = []
+    class Listener:
+        def __init__(self, address, handler):
+            self.server_address = address
+            opened.append(self)
+        def server_close(self): pass
+        def serve_forever(self): raise _Started
+    class Selector:
+        def __enter__(self): raise _Started
+        def __exit__(self, *exc): return False
+    monkeypatch.setattr(server, '_Server', Listener)
+    monkeypatch.setattr(server.selectors, 'DefaultSelector', Selector)
+    with pytest.raises(_Started):
+        server.main(argv)
+    return opened
+
+
+def test_host_names_reach_every_listener(monkeypatch):
+    opened = _start(monkeypatch, ['--host', '127.0.0.1', '--host', '192.168.68.103', '--port', '8765',
+                                  '--host-name', 'PC.Local.', '--host-name', 'pc'])
+    assert len(opened) == 2 and all(listener.host_names == frozenset({'pc.local', 'pc'}) for listener in opened)
+
+
+def test_settings_file_names_join_the_command_line_names(monkeypatch, tmp_path):
+    (tmp_path / 'web-settings.json').write_text('{"host_names": ["tiktak-ai.local", "Tiktak-AI"]}')
+    opened = _start(monkeypatch, ['--cache-dir', str(tmp_path), '--port', '8765', '--host-name', 'pc'])
+    assert opened[0].host_names == frozenset({'tiktak-ai.local', 'tiktak-ai', 'pc'})
+
+
+def test_no_settings_file_means_no_names(monkeypatch, tmp_path):
+    assert server.read_web_settings(str(tmp_path)) == ([], None)
+    assert server.read_web_settings(None) == ([], None)
+    assert _start(monkeypatch, ['--cache-dir', str(tmp_path), '--port', '8765'])[0].host_names == frozenset()
+
+
+@pytest.mark.parametrize('text', ['not json', '[]', '{}', '{"host_names": "pc"}', '{"host_names": [1]}',
+                                  '{"host_names": ["pc"], "extra": 1}', '{"host_names": ["*.local"]}',
+                                  '{"host_names": ["10.0.0.1"]}', '{"host_names": ["pc"' + ', "x"' * 9000 + ']}',
+                                  b'\xff\xfe'])
+def test_a_bad_settings_file_refuses_startup_before_any_bind(monkeypatch, tmp_path, capsys, text):
+    path = tmp_path / 'web-settings.json'
+    path.write_bytes(text if isinstance(text, bytes) else text.encode())
+    monkeypatch.setattr(server, '_Server', lambda *a: pytest.fail('bound despite a bad settings file'))
+    assert server.main(['--cache-dir', str(tmp_path)]) == 2
+    assert 'web-settings.json' in capsys.readouterr().err
+
+
+def test_a_settings_file_that_is_not_a_regular_file_is_refused(tmp_path):
+    (tmp_path / 'target.json').write_text('{"host_names": ["pc"]}')
+    (tmp_path / 'web-settings.json').symlink_to(tmp_path / 'target.json')
+    assert server.read_web_settings(str(tmp_path))[1]
+    (tmp_path / 'web-settings.json').unlink()
+    (tmp_path / 'web-settings.json').mkdir()
+    assert server.read_web_settings(str(tmp_path))[1]

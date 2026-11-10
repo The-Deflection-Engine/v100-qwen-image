@@ -1045,3 +1045,27 @@ def test_kv_cache_policy_is_automatic_from_references_and_quant(
     assert adapter._inner.use_kv_cache is use_kv
     assert stub.metadata["kv_cache_policy"] == policy
     adapter.close()
+
+
+def _fake_torch(name, total):
+    from types import SimpleNamespace
+    properties = SimpleNamespace(major=7, minor=0, name=name, total_memory=total)
+    cuda = SimpleNamespace(is_available=lambda: True, device_count=lambda: 1,
+                           get_device_properties=lambda index: properties,
+                           get_arch_list=lambda: ["sm_70"])
+    return SimpleNamespace(version=SimpleNamespace(cuda="12.6"), cuda=cuda)
+
+
+@pytest.mark.parametrize("name, total", [("Tesla V100-SXM2-16GB", 16945512448),
+                                         ("Tesla V100-SXM2-32GB", 34089730048),
+                                         ("Tesla V100S-PCIE-32GB", 34089730048)])
+def test_the_pipeline_accepts_16gb_and_32gb_v100s(name, total):
+    from qwen_engine.adapters import qwen21_diffusers as qd
+    assert qd._require_v100(_fake_torch(name, total)).total_memory == total
+
+
+def test_the_pipeline_refuses_a_v100_sized_unlike_any_reviewed_card():
+    from qwen_engine.adapters import qwen21_diffusers as qd
+    from qwen_engine.errors import HardwareAbsentError
+    with pytest.raises(HardwareAbsentError, match="V100 \\(16GB or 32GB\\)"):
+        qd._require_v100(_fake_torch("Tesla V100-SXM2-16GB", 24 * 1024**3))
