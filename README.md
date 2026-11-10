@@ -117,10 +117,12 @@ offered in that same list, or place it under `models/q8/` yourself.
 ### Web workspace
 
 ```bash
-./start-web.sh
+./start-web.sh          # local only: this PC, LAN and Tailscale
+./start-lightseed.sh    # also open to remote users via https://lightseed.up.railway.app
 ```
 
-Serves on port 8765 with a single shared job queue. It binds `127.0.0.1` plus
+`start-lightseed.sh` starts the Railway gateway and adds the remote listener;
+see [docs/railway.md](docs/railway.md). `start-web.sh` serves on port 8765 with a single shared job queue. It binds `127.0.0.1` plus
 this machine's LAN and Tailscale IPv4 addresses when it has them; override
 these with `QWEN_LAN_HOST`, `QWEN_TAILSCALE_HOST` and `QWEN_WEB_PORT`. It also answers to this PC's
 hostname, `<hostname>.local` and its Tailscale MagicDNS name, listed in
