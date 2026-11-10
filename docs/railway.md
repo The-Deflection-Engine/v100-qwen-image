@@ -157,6 +157,13 @@ visit, so Google's **Test users** list is the only allowlist while the consent
 screen stays in Testing. Removing someone on the Admin tab blocks them from
 being re-added; inviting the address again by hand lifts the block.
 
+**Day to day, use `./start-lightseed.sh`.** It checks the token file and
+Tailscale, starts the Railway gateway with `railway redeploy --from-source`
+(so it also works after `railway down`), then runs `./start-web.sh` with
+`QWEN_REMOTE_ORIGIN=https://lightseed.up.railway.app` and
+`QWEN_REMOTE_AUTO_INVITE=1`. Pass `--no-railway` when the gateway is already
+up. `./start-web.sh` on its own is still the local-only app.
+
 The remote listener sends TCP segments of at most 1,100 bytes: on the direct
 Tailscale path to Railway, full-size packets from the PC were silently dropped
 and pages hung after sign-in. `QWEN_REMOTE_TCP_MSS` overrides it (0 = off).
